@@ -1458,13 +1458,33 @@ launch_cmd = ns["build_strata_launch_cmd"]("/content/strata-bin/strata", ns["MOD
 assert "--family" in launch_cmd and launch_cmd[launch_cmd.index("--family") + 1] == "inkling-2-mini"
 assert "--model" in launch_cmd and launch_cmd[launch_cmd.index("--model") + 1] == "SQ-10"
 assert "--model-path" in launch_cmd and launch_cmd[launch_cmd.index("--model-path") + 1] == str(local_strata)
-assert "--drafting" in launch_cmd and launch_cmd[launch_cmd.index("--drafting") + 1] == "dspark"
+assert "--drafting" in launch_cmd and launch_cmd[launch_cmd.index("--drafting") + 1] == "auto"
 assert "--kv" in launch_cmd and launch_cmd[launch_cmd.index("--kv") + 1] == "fp8"
 assert "--parallel" in launch_cmd and launch_cmd[launch_cmd.index("--parallel") + 1] == "4"
 assert "--no-tui" in launch_cmd and "--restart" in launch_cmd
 
 src_cmd = ns["build_strata_source_setup_cmd"](pathlib.Path("/content/Strata/setup.sh"), ns["MODEL_SPEC"]["strata"], models_dir / "strata-data", local_strata)
 assert "--build" in src_cmd and "--gguf-dir" in src_cmd and str(local_strata) in src_cmd
+assert "--drafter" in src_cmd and src_cmd[src_cmd.index("--drafter") + 1] == "dspark"
+
+# Verify _ensure_strata_source_env skips broken python3 (like Colab 3.13 without ensurepip) and creates terminal/.venv with pip
+fake_strata = box / "work" / "Strata"
+(fake_strata / "terminal").mkdir(parents=True, exist_ok=True)
+(fake_strata / "terminal" / "setup.py").write_text("print('ok')\n")
+fake_bin = box / "fake_py_bin"
+fake_bin.mkdir(parents=True, exist_ok=True)
+broken_py = fake_bin / "python3"
+broken_py.write_text("#!/bin/sh\nexit 1\n")
+broken_py.chmod(0o755)
+old_path = os.environ.get("PATH", "")
+os.environ["PATH"] = f"{fake_bin}:{old_path}"
+try:
+    venv_dir = ns["_ensure_strata_source_env"](fake_strata)
+finally:
+    os.environ["PATH"] = old_path
+assert venv_dir == fake_strata / "terminal" / ".venv"
+assert (venv_dir / "bin" / "python").exists()
+assert subprocess.run([str(venv_dir / "bin" / "python"), "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 # Build & test expanded Project Maya runner (maya-inkling-2-mini + ablation default on)
 maya_cmd_sh = f"""

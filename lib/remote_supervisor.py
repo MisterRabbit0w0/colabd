@@ -1582,8 +1582,7 @@ def prepare_storage_and_deps() -> Tuple[Path, bool]:
         missing = [pkg for binary, pkg in checks if not shutil.which(binary)]
         if missing:
             emit_telemetry(phase="安装系统依赖")
-            run_checked(["apt-get", "update", "-qq"])
-            run_checked(["apt-get", "install", "-y", "-qq"] + missing)
+            _ensure_apt_packages(missing)
 
     return models_dir, ram_resident
 
@@ -1752,6 +1751,96 @@ def _stream_subprocess(cmd: List[str], cwd: Optional[Path], env: Dict[str, str])
 # ==============================================================================
 
 
+def _ensure_apt_packages(packages: List[str]) -> None:
+    if os.environ.get("MAYA_SKIP_APT") == "1" or not packages:
+        return
+    if not shutil.which("apt-get"):
+        return
+    run_checked(["apt-get", "update", "-qq"])
+    run_checked(["apt-get", "install", "-y", "-qq"] + packages)
+
+
+def _is_venv_capable_python(py_bin: str) -> bool:
+    try:
+        res = subprocess.run(
+            [py_bin, "-c", "import sys, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 10) else 1)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return res.returncode == 0
+    except OSError:
+        return False
+
+
+def _find_venv_capable_python() -> Optional[str]:
+    candidates: List[str] = []
+    for raw in (
+        "/usr/bin/python3",
+        shutil.which("python3.12"),
+        shutil.which("python3.11"),
+        shutil.which("python3.10"),
+        shutil.which("python3.13"),
+        shutil.which("python3"),
+        sys.executable,
+    ):
+        if not raw:
+            continue
+        cand = str(raw)
+        if cand not in candidates:
+            candidates.append(cand)
+    for cand in candidates:
+        if Path(cand).exists() and _is_venv_capable_python(cand):
+            return cand
+    return None
+
+
+def _ensure_strata_source_env(strata_src: Path) -> Path:
+    """Prepare build tools & a working Python venv for Strata/setup.sh.
+
+    Colab places Python 3.13 at `/usr/local/bin/python3` without `ensurepip`,
+    causing Strata's `setup.sh` (`PY=python3; ok_py $PY`) to fail even after
+    installing `python3-venv` for `/usr/bin/python3` (3.12). Pre-creating
+    `terminal/.venv` (or `.venv`) with a verified venv+pip interpreter lets
+    `setup.sh` jump straight to `exec .venv/bin/python setup.py`.
+    """
+    missing_tools = [
+        pkg for binary, pkg in [("cmake", "cmake"), ("g++", "build-essential")]
+        if not shutil.which(binary)
+    ]
+    if missing_tools:
+        emit_telemetry(phase="安装 Strata 源码编译依赖")
+        _ensure_apt_packages(missing_tools)
+
+    venv_root = (strata_src / "terminal") if (strata_src / "terminal" / "setup.py").is_file() else strata_src
+    venv_dir = venv_root / ".venv"
+    venv_py = venv_dir / "bin" / "python"
+    if venv_py.exists():
+        pip_ok = subprocess.run(
+            [str(venv_py), "-m", "pip", "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if pip_ok:
+            return venv_dir
+        shutil.rmtree(venv_dir, ignore_errors=True)
+
+    py_bin = _find_venv_capable_python()
+    if not py_bin and os.environ.get("MAYA_SKIP_APT") != "1":
+        emit_telemetry(phase="安装 Python venv 依赖")
+        _ensure_apt_packages(["python3", "python3-venv", "python3-pip"])
+        py_bin = _find_venv_capable_python()
+
+    if py_bin:
+        log(f"[REMOTE] 初始化 Strata 源码 Python 虚拟环境: {py_bin} -> {venv_dir}")
+        run_checked([py_bin, "-m", "venv", str(venv_dir)])
+    else:
+        uv_bin = shutil.which("uv")
+        if uv_bin:
+            log(f"[REMOTE] 使用 uv 初始化 Strata 源码 Python 虚拟环境: {venv_dir}")
+            run_checked([uv_bin, "venv", "--managed-python", "--seed", "--python", "3.12", str(venv_dir)])
+    return venv_dir
+
+
 def build_strata_launch_cmd(
     strata_bin: str,
     strata_spec: Dict[str, Any],
@@ -1785,10 +1874,13 @@ def build_strata_launch_cmd(
     ]
     if model_path is not None:
         cmd.extend(["--model-path", str(model_path)])
-    if MAYA_DRAFTING == "off":
+    draft_cfg = MAYA_DRAFTING.strip().lower()
+    if draft_cfg == "off":
         cmd.extend(["--drafting", "off"])
-    elif MAYA_DRAFTING == "on" and family == "inkling-2-mini":
-        cmd.extend(["--drafting", "dspark"])
+    elif draft_cfg in ("auto", "mtp", "dflash2"):
+        cmd.extend(["--drafting", draft_cfg])
+    elif draft_cfg in ("on", "measure"):
+        cmd.extend(["--drafting", "auto"])
     if STRATA_KV_FORMAT and STRATA_KV_FORMAT != "auto":
         cmd.extend(["--kv", STRATA_KV_FORMAT])
     if STRATA_PARALLEL.isdigit() and int(STRATA_PARALLEL) > 1:
@@ -2016,6 +2108,7 @@ def run_strata(models_dir: Path) -> int:
         emit_telemetry(phase="克隆 Niko1221/Strata 源码仓库")
         run_checked(["git", "clone", "--depth", "1", STRATA_REPO_URL, str(strata_src)])
 
+    _ensure_strata_source_env(strata_src)
     setup_sh = strata_src / "setup.sh"
     setup_cmd = build_strata_source_setup_cmd(setup_sh, strata_spec, strata_data_dir, model_path)
     emit_telemetry(phase="Strata 源码编译 CUDA 引擎并加载模型")
