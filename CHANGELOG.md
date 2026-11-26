@@ -9,7 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Modular CLI daemon (`bin/colabd` and `lib/*`) compatible with Linux and macOS Bash 3.2+.
 - Interactive terminal control panel with status dashboard, live build and inference log viewer, settings editor, and streaming API test runner.
-- Non-blocking Google Colab login probe, interactive OAuth 2.0 and `gcloud` ADC login flows, orphan-safe `colab logout` account switching, and remote VM GCP credential propagation via `colab auth`.
+- Non-blocking Google Colab login probe (`colab sessions` & `colab whoami`), full multi-account profile switching (OS keyring OAuth 2.0 slots + isolated `0600` ADC credentials + per-account `sessions.json`), real logout clearing OS keyring/ADC tokens, account-aware orphan-runtime release guards (`colabd down -a <name>` / `colabd down --all`), and remote VM GCP credential propagation via `colab auth`.
 - Default support for uncensored [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF) (`Mix-128G` and `Mix-256G`) alongside `GLM-5.3-Flash Maya-M-Derisked` and `Inkling 2 Mini` on [`mw00/project-maya`](https://github.com/mw00/project-maya).
 - Tiered shard pipeline: Google Drive shard lookup, sequential prefetch of the 161 GB `Engram-Q6_K` table onto local `/content` NVMe SSD, Hugging Face download fallback, and atomic `.syncing.tmp` background sync-back to Google Drive (`both`, `weights_only`, `engram_only`, `none`).
 - Full-RAM MoE expert residency control (`--mmap-experts off` and `DS4_REQUIRE_ALL_RAM=1`) to eliminate network filesystem I/O during token generation.

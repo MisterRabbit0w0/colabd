@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# colabd - Interactive TUI pages (Main Menu, Status, Logs, Settings, Auth)
+# colabd - Interactive TUI pages (Main Menu, Status, Logs, Settings, Multi-Account Auth)
+# Compatible with Bash 3.2+ (macOS and Linux)
 # ==============================================================================
 
 page_account_auth() {
-  refresh_colab_auth_status 5 || true
+  refresh_colab_auth_status 5 0 || true
   while true; do
     clear 2>/dev/null || true
     local cli_ver="未安装"
@@ -12,54 +13,100 @@ page_account_auth() {
       cli_ver="$(colab version 2>/dev/null | head -n 1 || echo "已安装")"
     fi
 
-    echo "${C_BOLD}${C_CYAN}================ Google Colab 账号登录与 GCP 授权中心 ================${C_RESET}"
+    echo "${C_BOLD}${C_CYAN}================ Google Colab 多账号切换与 GCP 授权中心 ================${C_RESET}"
     echo "  Colab CLI 版本 : ${cli_ver}"
+    echo "  当前激活槽位   : ${C_BOLD}$(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")${C_RESET}"
     echo "  当前认证模式   : ${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} - $(auth_mode_desc "$COLAB_AUTH_MODE")"
     echo "  当前登录状态   : $(format_auth_badge)"
     [[ -n "$AUTH_DETAIL" ]] && echo "  状态探测摘要   : ${AUTH_DETAIL}"
     echo "  远端 GCP 授权  : 启动实例时自动执行 colab auth = $( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "${C_GREEN}开启${C_RESET}" || echo "关闭" )"
-    echo "${C_CYAN}----------------------------------------------------------------------${C_RESET}"
-    echo "  1) 刷新检测登录状态与当前账号算力余额 (colab sessions & usage)"
-    echo "  2) 一键拉起 Google OAuth 2.0 登录 (个人 Free / Pro / Pro+ 账号推荐)"
-    echo "  3) 一键拉起 GCP ADC 登录 (gcloud application-default login)"
-    echo "  4) 登出并切换 Google 账号 (colab logout，带活跃实例防漏关保护)"
-    echo "  5) 为远端 Colab 实例执行 GCP 服务授权 (colab auth，用于直连 GCS 等)"
-    echo "  6) 切换【启动实例时自动执行远端 colab auth】开关"
-    echo "  7) 一键安装或升级官方 google-colab-cli"
+    echo ""
+    echo "  ${C_BOLD}已保存账号槽位${C_RESET} (* 表示当前激活，各槽位拥有独立 sessions.json):"
+    print_saved_accounts_table || true
+    echo "${C_CYAN}------------------------------------------------------------------------${C_RESET}"
+    echo "  1) 刷新检测登录状态、当前邮箱与算力余额 (whoami / sessions / usage)"
+    echo "  2) 快速切换已保存的账号槽位 (带活跃实例释放保护 -> 一键秒切)"
+    echo "  3) 添加并登录新的 Google 账号槽位 (支持 OAuth 2.0 / gcloud ADC)"
+    echo "  4) 将当前已登录账号归档为槽位 / 更新当前槽位备份"
+    echo "  5) 删除已保存的账号槽位 (先释放该账号活跃实例再彻底清除)"
+    echo "  6) 彻底登出当前账号 (先释放活跃实例 -> 清除系统钥匙串 / ADC 凭证)"
+    echo "  7) 扫描并一键释放所有已保存账号的残留 Colab 实例 (全局防扣费清理)"
+    echo "  8) 远端 Colab 实例 GCP 服务授权 (colab auth) / 切换自动授权开关"
+    echo "  9) 一键安装或升级官方 google-colab-cli"
     echo "  0) 返回上级菜单"
-    echo "${C_CYAN}======================================================================${C_RESET}"
-    read -r -p "请选择操作编号 [0-7]: " a_opt
+    echo "${C_CYAN}========================================================================${C_RESET}"
+    read -r -p "请选择操作编号 [0-9]: " a_opt
 
     case "${a_opt:-0}" in
       1)
         echo ""
-        if refresh_colab_auth_status 6; then
-          echo "${C_GREEN}[有效] 当前账号已正常登录！${C_RESET}"
-          echo "${C_DIM}--- colab --auth ${COLAB_AUTH_MODE} sessions ---${C_RESET}"
+        if refresh_colab_auth_status 6 1; then
+          echo "${C_GREEN}[有效] 当前账号已正常登录: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")${C_RESET}"
+          echo "${C_DIM}--- colab whoami ---${C_RESET}"
+          colab_cli whoami 2>&1 | sed 's/^/  /' || true
+          echo "${C_DIM}--- colab sessions ---${C_RESET}"
           colab_cli sessions 2>&1 | sed 's/^/  /' || true
-          echo "${C_DIM}--- colab --auth ${COLAB_AUTH_MODE} usage ---${C_RESET}"
+          echo "${C_DIM}--- colab usage ---${C_RESET}"
           colab_cli usage 2>&1 | sed 's/^/  /' || true
         else
           echo "${C_YELLOW}[未授权] ${AUTH_DETAIL}${C_RESET}"
         fi
         read -r -p "按回车继续..." _
         ;;
-      2) do_oauth2_login || true; read -r -p "按回车继续..." _ ;;
-      3) do_adc_login || true; read -r -p "按回车继续..." _ ;;
-      4) do_colab_logout_switch; read -r -p "按回车继续..." _ ;;
-      5) do_remote_gcp_auth; read -r -p "按回车继续..." _ ;;
-      6)
-        if [[ "$AUTO_GCP_AUTH" == "1" ]]; then AUTO_GCP_AUTH="0"; else AUTO_GCP_AUTH="1"; fi
-        save_config
+      2)
+        do_switch_account "" "prompt" || true
+        read -r -p "按回车继续..." _
         ;;
-      7) do_install_or_update_cli; read -r -p "按回车继续..." _ ;;
+      3)
+        do_add_new_account "" "" "prompt" || true
+        read -r -p "按回车继续..." _
+        ;;
+      4)
+        do_save_current_account "" || true
+        read -r -p "按回车继续..." _
+        ;;
+      5)
+        do_delete_account "" "prompt" || true
+        read -r -p "按回车继续..." _
+        ;;
+      6)
+        do_colab_logout "prompt" "1" || true
+        read -r -p "按回车继续..." _
+        ;;
+      7)
+        release_all_accounts_runtimes "1" || true
+        read -r -p "按回车继续..." _
+        ;;
+      8)
+        echo ""
+        echo "  1) 立即为当前运行中的远端实例执行 GCP 授权 (colab auth)"
+        echo "  2) 切换【启动实例时自动执行 colab auth】开关 (当前: $( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" ))"
+        echo "  3) 直接拉起 Google OAuth 2.0 登录 (不新建槽位)"
+        echo "  4) 直接拉起 GCP ADC 登录 (不新建槽位)"
+        read -r -p "请选择 [1-4，回车取消]: " g_opt
+        case "${g_opt:-}" in
+          1) do_remote_gcp_auth ;;
+          2)
+            if [[ "$AUTO_GCP_AUTH" == "1" ]]; then AUTO_GCP_AUTH="0"; else AUTO_GCP_AUTH="1"; fi
+            save_config
+            echo "${C_GREEN}[已更新] 启动自动 colab auth = $( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" )${C_RESET}"
+            ;;
+          3) do_oauth2_login || true ;;
+          4) do_adc_login || true ;;
+        esac
+        read -r -p "按回车继续..." _
+        ;;
+      9)
+        do_install_or_update_cli
+        read -r -p "按回车继续..." _
+        ;;
       0|"") break ;;
     esac
   done
 }
 
 page_status() {
-  refresh_colab_auth_status 4 || true
+  refresh_colab_auth_status 4 0 || true
   while true; do
     clear 2>/dev/null || true
     local phase gpu ram_gb local_free drive_free models_dir api_ok ep ram_res sync_st sync_msg
@@ -112,18 +159,18 @@ page_status() {
     echo "${C_BOLD}[Colab 会话状态 & 算力单元消耗 (colab status / colab usage)]${C_RESET}"
     if [[ "$AUTH_STATE" == "ok" ]]; then
       local target="${ACTIVE_SESSION_NAME:-$SESSION_NAME}"
-      echo "${C_DIM}--- colab --auth ${COLAB_AUTH_MODE} status -s ${target} ---${C_RESET}"
+      echo "${C_DIM}--- colab status -s ${target} ($(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")) ---${C_RESET}"
       colab_cli status -s "$target" 2>&1 | sed 's/^/  /' || echo "  (当前无活跃会话记录)"
-      echo "${C_DIM}--- colab --auth ${COLAB_AUTH_MODE} usage ---${C_RESET}"
+      echo "${C_DIM}--- colab usage ---${C_RESET}"
       colab_cli usage 2>&1 | sed 's/^/  /' || echo "  (无法获取算力单元用量)"
     else
-      echo "  (账号尚未登录或未安装 CLI，可按 a 进入账号页登录)"
+      echo "  (账号尚未登录或未安装 CLI，可按 a 进入多账号中心登录)"
     fi
     echo "${C_CYAN}=========================================================================${C_RESET}"
-    echo "操作: [r] 刷新  [t] 测试对话  [l] 实时日志  [g] 注入远端 GCP 授权  [a] 账号管理  [回车/b] 返回"
+    echo "操作: [r] 刷新  [t] 测试对话  [l] 实时日志  [g] 注入远端 GCP 授权  [a] 多账号中心  [回车/b] 返回"
     read -r -p "请选择: " sub
     case "${sub:-b}" in
-      r|R) refresh_colab_auth_status 4 || true; continue ;;
+      r|R) refresh_colab_auth_status 4 1 || true; continue ;;
       t|T) action_test_request ;;
       l|L) action_view_logs ;;
       g|G) do_remote_gcp_auth; read -r -p "按回车继续..." _ ;;
@@ -191,7 +238,7 @@ page_settings() {
     echo "  9) HuggingFace Token: $(mask_secret "$HF_TOKEN") (orcarouter 去审查版必填)"
     echo "  10) API Key 与端口  : Key=$(mask_secret "$MAYA_API_KEY") | 端口=${MAYA_PORT} | 本地绑定=${LOCAL_BIND}"
     echo "  11) 上下文与界面开关: ${MAYA_CONTEXT} tok | 视觉=$( [[ "$NO_VISION" == "0" ]] && echo "开" || echo "关" ) | Web面板=$( [[ "$WEB_UI" == "1" ]] && echo "开" || echo "仅API" )"
-    echo "  12) Colab 认证与 GCP: 模式=${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} | 启动自动 colab auth=$( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" )"
+    echo "  12) Colab 账号与认证: 槽位=${C_GREEN}${ACTIVE_ACCOUNT:-(未归档)}${C_RESET} | 模式=${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} | 启动自动 colab auth=$( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" )"
     echo "  13) 恢复默认设置"
     echo "  0) 返回主菜单"
     echo "${C_CYAN}================================================================================${C_RESET}"
@@ -365,14 +412,34 @@ page_settings() {
         ;;
       12)
         echo ""
-        echo "  1) 切换认证策略为 oauth2 (Google OAuth 2.0 个人账号)"
-        echo "  2) 切换认证策略为 adc (gcloud Application Default Credentials)"
+        echo "  1) 切换默认认证策略为 oauth2 (Google OAuth 2.0 个人账号)"
+        echo "  2) 切换默认认证策略为 adc (gcloud Application Default Credentials)"
         echo "  3) 切换【启动实例时自动执行远端 colab auth】开关 (当前: $( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" ))"
-        echo "  4) 打开完整【Colab 账号登录 / 登出切换 / 远端 GCP 授权中心】"
+        echo "  4) 打开完整【Colab 多账号切换 / 真登出 / 全局释放 / GCP 授权中心】"
         read -r -p "选择编号 [1-4，默认 4]: " ca_idx
         case "${ca_idx:-4}" in
-          1) COLAB_AUTH_MODE="oauth2"; save_config; refresh_colab_auth_status 4 || true ;;
-          2) COLAB_AUTH_MODE="adc";    save_config; refresh_colab_auth_status 4 || true ;;
+          1)
+            if [[ "$COLAB_AUTH_MODE" != "oauth2" ]]; then
+              if guard_release_before_account_change "切换认证策略为 oauth2" "" "prompt" "0"; then
+                ACTIVE_ACCOUNT=""
+                AUTH_EMAIL=""
+                COLAB_AUTH_MODE="oauth2"
+                save_config
+                refresh_colab_auth_status 4 0 || true
+              fi
+            fi
+            ;;
+          2)
+            if [[ "$COLAB_AUTH_MODE" != "adc" ]]; then
+              if guard_release_before_account_change "切换认证策略为 adc" "" "prompt" "0"; then
+                ACTIVE_ACCOUNT=""
+                AUTH_EMAIL=""
+                COLAB_AUTH_MODE="adc"
+                save_config
+                refresh_colab_auth_status 4 0 || true
+              fi
+            fi
+            ;;
           3)
             if [[ "$AUTO_GCP_AUTH" == "1" ]]; then AUTO_GCP_AUTH="0"; else AUTO_GCP_AUTH="1"; fi
             save_config
@@ -381,12 +448,14 @@ page_settings() {
         esac
         ;;
       13)
-        read -r -p "确认清空并恢复所有默认设置? [y/N]: " yn
+        read -r -p "确认清空并恢复所有默认设置 (已保存的多账号槽位将保留)? [y/N]: " yn
         if [[ "${yn:-N}" =~ ^[Yy]$ ]]; then
+          local keep_acct="$ACTIVE_ACCOUNT"
           HF_TOKEN=""
           reset_defaults
+          ACTIVE_ACCOUNT="$keep_acct"
           save_config
-          refresh_colab_auth_status 4 || true
+          refresh_colab_auth_status 4 0 || true
         fi
         ;;
       0|"")
@@ -397,7 +466,7 @@ page_settings() {
 }
 
 run_interactive_loop() {
-  refresh_colab_auth_status 4 || true
+  refresh_colab_auth_status 4 0 || true
 
   while true; do
     clear 2>/dev/null || true
@@ -428,7 +497,7 @@ run_interactive_loop() {
     echo "  3) 实时查看远端分片拉取、编译与推理日志 (Ctrl+C 返回菜单)"
     echo "  4) 一键发送流式对话测试请求 (curl /v1/chat/completions)"
     echo "  5) 设置页 (切换模型 / 存储拓扑 / 云盘查找与回存策略 / 隧道，自动保存)"
-    echo "  6) Colab 账号与授权中心 (登录态检测 / OAuth & ADC 登录 / logout 切号 / colab auth)"
+    echo "  6) Colab 多账号切换与授权中心 (一键秒切 / 增删槽位 / 真登出 / 全局释放)"
     echo "  7) 手动销毁当前 Colab 实例 (保持面板打开以便修改配置重开)"
     echo "  0) 退出面板 (自动执行 colab stop 回收实例与释放算力)"
     echo "${C_CYAN}=========================================================================${C_RESET}"
@@ -452,6 +521,15 @@ run_interactive_loop() {
           read -r -p "按回车立即中止同步并销毁实例，或输入 c 取消退出等待同步完成: " quit_confirm
           if [[ "${quit_confirm:-}" =~ ^[Cc]$ ]]; then
             continue
+          fi
+        fi
+        local other_sessions=""
+        if other_sessions="$(find_other_accounts_with_local_sessions 2>/dev/null)"; then
+          echo ""
+          echo "${C_YELLOW}[防扣费提醒] 检测到其他已保存账号槽位仍有未释放的本地会话记录: ${other_sessions}${C_RESET}"
+          read -r -p "是否在退出前一并扫描释放所有已保存账号的残留实例? [Y/n]: " rel_all_yn
+          if [[ ! "${rel_all_yn:-Y}" =~ ^[Nn]$ ]]; then
+            release_all_accounts_runtimes "0" || true
           fi
         fi
         echo "${C_CYAN}[退出] 正在关闭 colabd 控制台并执行自动实例回收...${C_RESET}"

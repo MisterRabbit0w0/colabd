@@ -40,21 +40,208 @@ colabd v${COLABD_VERSION}
 The endgame for frontier LLM serving on Google Colab.
 
 Usage:
-  colabd                  Launch the interactive TUI control panel (default)
-  colabd up               Start the configured Colab runtime and enter the TUI tether
-  colabd auth             Open the Google Colab account login and GCP auth center
-  colabd settings         Open the persistent configuration menu
-  colabd down             Immediately stop the configured Colab runtime session
-  colabd version          Print colabd version
-  colabd help             Show this help message
+  colabd                                  Launch the interactive TUI control panel (default)
+  colabd up                               Start the configured Colab runtime and enter the TUI tether
+  colabd auth                             Open the interactive multi-account & GCP auth center
+  colabd auth list                        List saved account profiles and local active sessions
+  colabd auth whoami                      Show active profile, email, sessions, and compute usage
+  colabd auth use <name> [--release|-y|--keep]
+                                          Release active runtime (with guard) and switch account
+  colabd auth add [name] [--oauth2|--adc] [--release|-y]
+                                          Add and authenticate a new account profile
+  colabd auth save [name]                 Archive the current login into a named account profile
+  colabd auth remove <name> [--release|-y]
+                                          Release target account runtimes and delete its profile
+  colabd auth logout [--release|-y]       Release active runtime and clear local keyring/ADC tokens
+  colabd switch <name> [--release|-y|--keep]
+                                          Shortcut for 'colabd auth use <name>'
+  colabd down                             Stop active runtime(s) on the current account
+  colabd down -a|--account <name>         Stop active runtime(s) on a specific saved account
+  colabd down --all                       Scan and release active runtimes across ALL saved accounts
+  colabd settings                         Open the persistent configuration menu
+  colabd version                          Print colabd version
+  colabd help                             Show this help message
 
-Configuration:
+Configuration & Accounts:
   ${CONFIG_FILE} (mode 0600)
+  ${ACCOUNTS_DIR}/<alias>/ (isolated sessions.json & metadata, mode 0700/0600)
 
 Lifecycle safety:
-  Exiting the interactive session or pressing Ctrl+C automatically runs
-  'colab stop' to release your Colab GPU runtime and stop Compute Unit burn.
+  Exiting the interactive session, pressing Ctrl+C, switching accounts, logging out,
+  or deleting a profile automatically triggers orphan-runtime protection ('colab stop')
+  against the exact owning account so GPU Compute Units do not burn in the background.
 EOF
+}
+
+handle_auth_cli() {
+  local action="${1:-}"
+  if [[ -z "$action" ]]; then
+    page_account_auth
+    return 0
+  fi
+  shift
+
+  case "$action" in
+    list|ls)
+      echo "已保存的 Google Colab 账号槽位 (当前激活: ${ACTIVE_ACCOUNT:-无}):"
+      print_saved_accounts_table || true
+      return 0
+      ;;
+    whoami|status)
+      if refresh_colab_auth_status 6 1; then
+        echo "当前账号: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")"
+        colab_cli whoami 2>&1 || true
+        colab_cli sessions 2>&1 || true
+        colab_cli usage 2>&1 || true
+        return 0
+      else
+        echo "当前未登录或令牌失效: ${AUTH_DETAIL}" >&2
+        return 1
+      fi
+      ;;
+    use|switch)
+      local target=""
+      local mode="prompt"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --release|-y|--yes) mode="release" ;;
+          --keep)             mode="keep" ;;
+          -*)
+            echo "[ERROR] Unknown option for 'colabd auth use': $1" >&2
+            return 1
+            ;;
+          *)
+            target="$1"
+            ;;
+        esac
+        shift
+      done
+      refresh_colab_auth_status 4 0 || true
+      do_switch_account "$target" "$mode"
+      return $?
+      ;;
+    add|login)
+      local alias=""
+      local auth_m=""
+      local mode="prompt"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --oauth2)           auth_m="oauth2" ;;
+          --adc)              auth_m="adc" ;;
+          --release|-y|--yes) mode="release" ;;
+          -*)
+            echo "[ERROR] Unknown option for 'colabd auth add': $1" >&2
+            return 1
+            ;;
+          *)
+            alias="$1"
+            ;;
+        esac
+        shift
+      done
+      refresh_colab_auth_status 4 0 || true
+      do_add_new_account "$alias" "$auth_m" "$mode"
+      return $?
+      ;;
+    save)
+      local alias="${1:-}"
+      do_save_current_account "$alias"
+      return $?
+      ;;
+    remove|rm|delete)
+      local target=""
+      local mode="prompt"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --release|-y|--yes) mode="release" ;;
+          -*)
+            echo "[ERROR] Unknown option for 'colabd auth remove': $1" >&2
+            return 1
+            ;;
+          *)
+            target="$1"
+            ;;
+        esac
+        shift
+      done
+      refresh_colab_auth_status 4 0 || true
+      do_delete_account "$target" "$mode"
+      return $?
+      ;;
+    logout)
+      local mode="prompt"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --release|-y|--yes) mode="release" ;;
+          --keep)             mode="keep" ;;
+          -*)
+            echo "[ERROR] Unknown option for 'colabd auth logout': $1" >&2
+            return 1
+            ;;
+        esac
+        shift
+      done
+      refresh_colab_auth_status 4 0 || true
+      do_colab_logout "$mode" "0"
+      return $?
+      ;;
+    *)
+      echo "[ERROR] Unknown auth subcommand: ${action}" >&2
+      print_help >&2
+      return 1
+      ;;
+  esac
+}
+
+handle_down_cli() {
+  local all_accounts=0
+  local target_account=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)
+        all_accounts=1
+        ;;
+      -a|--account)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing account name after $1" >&2
+          return 1
+        fi
+        target_account="$2"
+        shift
+        ;;
+      -*)
+        echo "[ERROR] Unknown option for 'colabd down': $1" >&2
+        return 1
+        ;;
+      *)
+        target_account="$1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ "$all_accounts" -eq 1 ]]; then
+    release_all_accounts_runtimes "0"
+    return $?
+  fi
+
+  if [[ -n "$target_account" ]]; then
+    stop_colab_instance "$target_account"
+    return $?
+  fi
+
+  refresh_colab_auth_status 4 0 || true
+  local sess_cfg
+  sess_cfg="$(colab_session_config_path "$ACTIVE_ACCOUNT")"
+  local has_local=""
+  has_local="$(account_store sessions-list "$sess_cfg" 2>/dev/null || true)"
+  if [[ -n "$has_local" ]]; then
+    stop_colab_instance
+  else
+    MANAGED_SESSION=1
+    stop_colab_instance
+  fi
+  return 0
 }
 
 main() {
@@ -77,8 +264,15 @@ main() {
       ;;
     auth)
       COLABD_SKIP_AUTO_STOP=1
-      page_account_auth
-      exit 0
+      shift
+      handle_auth_cli "$@"
+      exit $?
+      ;;
+    switch)
+      COLABD_SKIP_AUTO_STOP=1
+      shift
+      handle_auth_cli use "$@"
+      exit $?
       ;;
     settings|config)
       COLABD_SKIP_AUTO_STOP=1
@@ -87,10 +281,9 @@ main() {
       ;;
     down|stop)
       COLABD_SKIP_AUTO_STOP=1
-      refresh_colab_auth_status 4 || true
-      MANAGED_SESSION=1
-      stop_colab_instance
-      exit 0
+      shift
+      handle_down_cli "$@"
+      exit $?
       ;;
     "")
       run_interactive_loop

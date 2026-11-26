@@ -22,7 +22,7 @@ The endgame for frontier LLM serving on Google Colab.
 
 - **云盘预查找 + 本地 NVMe 跑 Engram + 专家全内存锁页。** 在推荐的 `nvme_engram` 模式下，脚本启动先检索 Google Drive 是否已有缓存分片，把 161 GB `Engram-Q6_K` 顺序拉取到本地高速 `/content` NVMe SSD，缺失分片自动回退走 Hugging Face 公网下载；同时将 114 GB 主权重软链至云盘并在启动时一次性全量锁入显存与系统内存 (`--mmap-experts off`，见 [`project-maya` 内存文档](https://github.com/mw00/project-maya/blob/main/docs/MEMORY.md))。进入服务态后，专家层计算 100% 走内存，Engram 随机查表 100% 走本地 NVMe 与约 140 GB 系统页缓存，推理期零网盘 I/O。
 - **后台原子回存云盘。** 服务通过 `/health` 探测就绪后，后台线程按策略 (`both`、`weights_only`、`engram_only`、`none`) 将本次回退下载的新分片先写为 `.syncing.tmp` 再原子重命名同步回 Google Drive，中断退出绝不留半截脏文件。
-- **内核保活与系留回收。** 远端守护程序通过 `colab exec` 在 Jupyter 内核内运行以维持官方保活；本机注册 `EXIT`、`INT`、`TERM`、`HUP` 信号钩子，退出面板自动调用 `colab stop`，切换账号执行 `colab logout` 前也会主动拦截并提示先回收旧账号实例。
+- **内核保活与多账号系留回收。** 远端守护程序通过 `colab exec` 在 Jupyter 内核内运行以维持官方保活；本机注册 `EXIT`、`INT`、`TERM`、`HUP` 信号钩子，退出面板自动按实例归属账号调用 `colab stop`。针对官方 `google-colab-cli` 未提供 `logout` 子命令的问题，内置多账号槽位管理（OAuth 2.0 系统钥匙串多槽位 + 独立 `adc.json` + 隔离的 `sessions.json`），在切号、真登出或删除槽位前均会先拦截并释放旧账号活跃实例，并支持 `colabd down --all` 一键全局清理所有已保存账号的残留实例。
 
 ## 快速上手
 
@@ -70,12 +70,20 @@ colabd
 ## 命令行子命令
 
 ```bash
-colabd              # 启动交互式数字菜单控制台 (默认)
-colabd up           # 直接拉起配置的 Colab 实例并进入控制台保活
-colabd auth         # 打开 Colab 账号登录、多账号切换与远端 GCP 授权中心
-colabd settings     # 打开本地持久化设置页
-colabd down         # 立即销毁当前配置的 Colab 实例
-colabd version      # 查看版本号
+colabd                         # 启动交互式数字菜单控制台 (默认)
+colabd up                      # 直接拉起配置的 Colab 实例并进入控制台保活
+colabd auth                    # 打开多账号切换、真登出、全局释放与远端 GCP 授权中心
+colabd auth list               # 查看已保存账号槽位与各账号本地活跃会话
+colabd auth add [name]         # 新增并登录账号槽位 (支持 --oauth2 / --adc)
+colabd auth save [name]        # 将当前已登录账号归档为独立槽位
+colabd auth use <name>         # 释放当前账号活跃实例后一键秒切目标账号 (简写: colabd switch <name>)
+colabd auth logout             # 先释放活跃实例，再清除系统钥匙串 OAuth2 / ADC 凭证实现真登出
+colabd auth remove <name>      # 先释放目标账号活跃实例，再删除其槽位与凭证
+colabd settings                # 打开本地持久化设置页
+colabd down                    # 立即销毁当前激活账号的活跃实例
+colabd down -a <name>          # 销毁指定已保存账号槽位的活跃实例
+colabd down --all              # 扫描并释放所有已保存账号的残留 Colab 实例
+colabd version                 # 查看版本号
 ```
 
 ## 本地校验与测试

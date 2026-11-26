@@ -10,7 +10,7 @@ help:
 
 lint:
 	bash -n bin/colabd lib/*.sh scripts/*.sh tests/*.sh
-	python3 -m py_compile lib/remote_supervisor.py
+	python3 -m py_compile lib/*.py
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		shellcheck -x bin/colabd scripts/*.sh tests/*.sh; \
 	else \

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# colabd - Core configuration, state paths, and model metadata
+# colabd - Core configuration, state paths, multi-account CLI wrapper, metadata
 # Compatible with Bash 3.2+ (macOS and Linux)
 # ==============================================================================
 
 COLABD_VERSION="0.1.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/colabd"
+ACCOUNTS_DIR="${CONFIG_DIR}/accounts"
+COLAB_CLI_CONFIG_DIR="${COLAB_CLI_CONFIG_DIR:-$HOME/.config/colab-cli}"
 LEGACY_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/colab-maya/config.env"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
 
@@ -19,10 +21,15 @@ EXEC_PID=""
 SSH_PID=""
 MANAGED_SESSION=0
 ACTIVE_SESSION_NAME=""
+ACTIVE_SESSION_HAS_OWNER=0
+ACTIVE_SESSION_ACCOUNT=""
+ACTIVE_SESSION_AUTH_MODE=""
 
 # Auth probe cache: missing_cli | unauth | ok | unknown
 AUTH_STATE="unknown"
 AUTH_DETAIL=""
+AUTH_EMAIL=""
+LAST_GUARD_KEPT_REMOTE=0
 
 ADC_SCOPES="openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory"
 
@@ -48,6 +55,7 @@ generate_api_key() {
 
 reset_defaults() {
   SESSION_NAME="colabd-llm"
+  ACTIVE_ACCOUNT=""                            # Saved profile alias under ~/.config/colabd/accounts/<alias>
   COLAB_AUTH_MODE="oauth2"                     # oauth2 | adc
   AUTO_GCP_AUTH="0"                            # 1: run `colab auth` on session start
   GPU_TYPE="G4"                                # G4 (RTX PRO 6000 96GB) | H100 | A100 | L4 | T4
@@ -84,6 +92,7 @@ save_config() {
     {
       echo "# colabd local configuration (mode 0600, do not commit)"
       printf 'SESSION_NAME=%q\n' "$SESSION_NAME"
+      printf 'ACTIVE_ACCOUNT=%q\n' "$ACTIVE_ACCOUNT"
       printf 'COLAB_AUTH_MODE=%q\n' "$COLAB_AUTH_MODE"
       printf 'AUTO_GCP_AUTH=%q\n' "$AUTO_GCP_AUTH"
       printf 'GPU_TYPE=%q\n' "$GPU_TYPE"
@@ -133,8 +142,76 @@ load_config() {
   fi
 }
 
+colab_session_config_path() {
+  local acct="${1-}"
+  if [[ -n "$acct" ]]; then
+    echo "${ACCOUNTS_DIR}/${acct}/sessions.json"
+  else
+    echo "${COLAB_CLI_CONFIG_DIR}/sessions.json"
+  fi
+}
+
+colab_adc_credentials_path() {
+  local acct="${1-}"
+  if [[ -n "$acct" && -f "${ACCOUNTS_DIR}/${acct}/adc.json" ]]; then
+    echo "${ACCOUNTS_DIR}/${acct}/adc.json"
+  else
+    echo "${GOOGLE_APPLICATION_CREDENTIALS:-${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}/application_default_credentials.json}"
+  fi
+}
+
+colab_cli_for() {
+  local auth_mode="$1"
+  local acct="$2"
+  shift 2
+
+  local sess_cfg=""
+  if [[ -n "$acct" ]]; then
+    sess_cfg="$(colab_session_config_path "$acct")"
+    mkdir -p "$(dirname "$sess_cfg")"
+    chmod 700 "$(dirname "$sess_cfg")" 2>/dev/null || true
+  elif [[ "$COLAB_CLI_CONFIG_DIR" != "$HOME/.config/colab-cli" ]]; then
+    sess_cfg="${COLAB_CLI_CONFIG_DIR}/sessions.json"
+    mkdir -p "$(dirname "$sess_cfg")"
+  fi
+
+  local adc_override=""
+  if [[ "$auth_mode" == "adc" && -n "$acct" && -f "${ACCOUNTS_DIR}/${acct}/adc.json" ]]; then
+    adc_override="${ACCOUNTS_DIR}/${acct}/adc.json"
+  fi
+
+  if [[ -n "$adc_override" && -n "$sess_cfg" ]]; then
+    GOOGLE_APPLICATION_CREDENTIALS="$adc_override" colab --config "$sess_cfg" --auth "$auth_mode" "$@"
+  elif [[ -n "$adc_override" ]]; then
+    GOOGLE_APPLICATION_CREDENTIALS="$adc_override" colab --auth "$auth_mode" "$@"
+  elif [[ -n "$sess_cfg" ]]; then
+    colab --config "$sess_cfg" --auth "$auth_mode" "$@"
+  else
+    colab --auth "$auth_mode" "$@"
+  fi
+}
+
 colab_cli() {
-  colab --auth "$COLAB_AUTH_MODE" "$@"
+  colab_cli_for "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$@"
+}
+
+format_account_label() {
+  local acct="${1-}"
+  local mode="${2:-$COLAB_AUTH_MODE}"
+  local email="${3-}"
+  if [[ -n "$acct" ]]; then
+    if [[ -n "$email" ]]; then
+      echo "${acct} (${email} | ${mode})"
+    else
+      echo "${acct} (${mode})"
+    fi
+  else
+    if [[ -n "$email" ]]; then
+      echo "默认未归档账号 (${email} | ${mode})"
+    else
+      echo "默认未归档账号 (${mode})"
+    fi
+  fi
 }
 
 mask_secret() {
