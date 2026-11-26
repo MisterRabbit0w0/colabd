@@ -23,14 +23,14 @@ Serving 300B to 750B MoE models on consumer Google Colab hits three concrete wal
 - **Zero network I/O during inference.** In `nvme_engram` mode, `colabd` checks your Google Drive cache first, pulls the 161 GB `Engram-Q6_K` shards onto the fast local `/content` NVMe SSD, falls back to Hugging Face download for any missing shard, and symlinks the 114 GB `Mix-128G` weights from Google Drive. At startup, [`project-maya`](https://github.com/mw00/project-maya/blob/main/docs/MEMORY.md) loads all 114 GB of weights into your 272.5 GB VRAM + pinned RAM pool (`--mmap-experts off`). Once ready, experts run 100% from memory and Engram lookups hit local NVMe plus ~140 GB of Linux page cache.
 - **Atomic Drive cache sync.** After the server reaches `/health` HTTP 200, a background worker copies newly downloaded shards back to Google Drive using `.syncing.tmp` temporary files and atomic `os.replace()` renames, governed by your save policy (`both`, `weights_only`, `engram_only`, `none`).
 - **Self-contained isolated `uv` runtime.** `install.sh` and `colabd env setup` automatically provision a dedicated Python 3.12 virtualenv in `~/.local/share/colabd-runtime/venv` containing `google-colab-cli` (and bootstrap a private `uv` binary without modifying your shell profile if `uv` is not installed). Every local helper, `keyring` account operation, `colab` invocation, and SSH `ProxyCommand` runs inside that isolated venv — immune to macOS Python 3.9, Ubuntu 22.04 Python 3.10, PEP 668, `conda`/`pyenv` shims, or missing `PATH` entries.
-- **Tethered lifecycle & multi-account release safety.** `colabd` executes the remote supervisor inside the Colab Jupyter kernel via `colab exec` to satisfy activity-based liveness, binds `SIGINT`, `SIGTERM`, `SIGHUP`, and `EXIT` traps to stop the runtime under its exact owning account, and solves `google-colab-cli`'s lack of a `logout` command via isolated multi-account profiles (OS keyring slots + `0600` ADC snapshots + per-account `sessions.json`). Switching accounts, logging out, or deleting a profile automatically triggers orphan-runtime release guards, and `colabd down --all` sweeps all saved accounts.
+- **Tethered lifecycle, identity-based accounts & scope repair.** `colabd` executes the remote supervisor inside the Colab Jupyter kernel via `colab exec` for activity-based liveness, binds `SIGINT`/`SIGTERM`/`SIGHUP`/`EXIT` traps to stop runtimes under their exact owning account, and manages accounts keyed uniquely by normalized `(email, auth_mode)` (automatic deduplication, OS keyring OAuth 2.0 storage, `0600` ADC snapshots, and per-account `sessions.json`). Login and `colabd auth refresh` inspect granted `Scopes` via `colab whoami` to catch and repair missing permissions (such as `colaboratory` or `drive.file`), while `auth remove` / `auth logout` enforce a hard release gate that refuses to delete credentials if stopping active runtimes fails.
 
 ## Architecture
 
 ```text
 Local Host (Linux / macOS, Bash 3.2+)
   └── colabd (TUI Dashboard + Account-Aware Lifecycle Trap -> `colab stop` on exit)
-        ├── Auth Center: Multi-Account OAuth 2.0 Keyring Slots / Isolated ADC / Real Logout / `colab auth`
+        ├── Auth Center: Identity-Based OAuth 2.0 Keyring / Isolated ADC / Scope Repair / Safe Logout
         ├── Tunnel Bridge: Cloudflare HTTPS or `colab ssh --proxy-mode` -> 127.0.0.1:8080
         └── `colab exec` (keeps Colab Jupyter kernel active)
               │
@@ -101,18 +101,19 @@ Configure both the runtime layout (`STORAGE_MODE`) and post-download write-back 
 ```bash
 colabd                         # Open the interactive TUI control panel
 colabd up                      # Allocate/start runtime immediately and attach TUI tether
-colabd auth                    # Open multi-account switcher, real logout, and GCP auth center
-colabd auth list               # List saved account profiles and per-account active sessions
-colabd auth add [name]         # Add and authenticate a new account profile (--oauth2 / --adc)
-colabd auth save [name]        # Archive the current login into a named profile
-colabd auth use <name>         # Release active runtime (with guard) and switch account
-colabd switch <name>           # Shortcut for 'colabd auth use <name>'
-colabd auth logout             # Release active runtime and clear keyring / ADC credentials
-colabd auth remove <name>      # Release target account runtimes and delete its profile
+colabd auth                    # Open account management, scope check & GCP auth center
+colabd auth list               # List logged-in accounts (deduped by email), scope status & sessions
+colabd auth login              # Log in a Google account (auto-dedup + strict scope check, --oauth2 / --adc)
+colabd auth refresh [id]       # Re-authorize in-place to repair missing scopes without losing sessions.json
+colabd auth use <id>           # Release active runtime (with guard) and switch account
+colabd switch <id>             # Shortcut for 'colabd auth use <id>'
+colabd auth note <id> <text>   # Edit an optional display note for an account
+colabd auth remove <id>        # Fail-closed release of active runtimes, then remove account (--revoke / --force)
+colabd auth logout             # Safely release & remove the currently active account (--revoke / --force)
 colabd settings                # Open persistent configuration editor
 colabd down                    # Stop active runtime(s) on the current account
-colabd down -a <name>          # Stop active runtime(s) on a specific saved account
-colabd down --all              # Sweep and stop active runtimes across ALL saved accounts
+colabd down -a <id>            # Stop active runtime(s) on a specific account
+colabd down --all              # Sweep and stop active runtimes across ALL accounts
 colabd env [status|setup|upgrade|reset]
                                # Inspect, bootstrap, upgrade, or rebuild the isolated uv venv
 colabd doctor                  # Alias for 'colabd env status'

@@ -13,6 +13,7 @@ Responsibilities:
 
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -90,6 +91,10 @@ TEMP_SUFFIXES = (".tmp", ".part", ".pulling.tmp", ".syncing.tmp")
 
 procs = []
 telemetry_lock = threading.Lock()
+output_queue = queue.Queue()
+_main_thread_id = threading.get_ident()
+_main_loop_active = False
+
 TELEMETRY = {
     "phase": "初始化远端环境",
     "gpu": "检测中...",
@@ -106,15 +111,24 @@ TELEMETRY = {
 }
 
 
+def _emit_line(line: str) -> None:
+    """Emit output on the main kernel thread so ipykernel 6+ preserves parent_header."""
+    if _main_loop_active and threading.get_ident() != _main_thread_id:
+        output_queue.put(line)
+    else:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    _emit_line(f"{msg}\n")
 
 
 def emit_telemetry(**updates) -> None:
     with telemetry_lock:
         TELEMETRY.update(updates)
         payload = json.dumps(TELEMETRY, ensure_ascii=False)
-    print(f"[TELEMETRY] {payload}", flush=True)
+    _emit_line(f"[TELEMETRY] {payload}\n")
 
 
 def refresh_disk_metrics() -> None:
@@ -146,16 +160,22 @@ def terminate_all(*_args) -> None:
     for p in reversed(procs):
         if p and p.poll() is None:
             try:
-                p.terminate()
+                os.killpg(p.pid, signal.SIGTERM)
             except Exception:
-                pass
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
     time.sleep(2)
     for p in reversed(procs):
         if p and p.poll() is None:
             try:
-                p.kill()
+                os.killpg(p.pid, signal.SIGKILL)
             except Exception:
-                pass
+                try:
+                    p.kill()
+                except Exception:
+                    pass
     if DRIVE_MOUNT_ROOT.exists():
         cleanup_temp_files(Path(DRIVE_CACHE_DIR))
     sys.exit(0)
@@ -427,6 +447,14 @@ def prepare_storage_and_deps():
         log(f"[REMOTE] 存储拓扑: 全量云盘直连 ({models_dir})")
 
     elif STORAGE_MODE == "nvme_engram":
+        if is_ds4 and not drive_available:
+            local_free_gb = shutil.disk_usage(WORK_DIR if WORK_DIR.exists() else Path("/")).free / (1024 ** 3)
+            if local_free_gb < 280.0:
+                log(
+                    f"[REMOTE][ERROR] nvme_engram 模式依赖 Google Drive 挂载主权重，但未检测到 {DRIVE_MOUNT_ROOT} "
+                    f"(且本地盘仅剩 {local_free_gb:.1f} GiB < 280 GiB)，已中止以防写爆磁盘。"
+                )
+                sys.exit(2)
         models_dir = Path(CUSTOM_MODELS_DIR)
         models_dir.mkdir(parents=True, exist_ok=True)
         cleanup_temp_files(models_dir)
@@ -549,11 +577,20 @@ def start_tunnel() -> None:
     if not cf_bin.exists():
         emit_telemetry(phase="下载 cloudflared 客户端")
         log("[REMOTE] 正在下载官方 cloudflared 客户端...")
-        urllib.request.urlretrieve(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-            cf_bin,
-        )
-        cf_bin.chmod(0o755)
+        tmp_cf = cf_bin.with_name(cf_bin.name + ".downloading.tmp")
+        try:
+            urllib.request.urlretrieve(
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+                tmp_cf,
+            )
+            tmp_cf.chmod(0o755)
+            os.replace(tmp_cf, cf_bin)
+        except Exception:
+            try:
+                tmp_cf.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     if TUNNEL_MODE == "cf_named":
         if not CF_TUNNEL_TOKEN:
@@ -565,8 +602,16 @@ def start_tunnel() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
         procs.append(p)
+
+        def drain_cf_named() -> None:
+            assert p.stdout is not None
+            for _line in p.stdout:
+                pass
+
+        threading.Thread(target=drain_cf_named, daemon=True).start()
         pub = CF_PUBLIC_HOSTNAME.strip() or "https://<Cloudflare-Zero-Trust-绑定域名>"
         if not pub.startswith("http"):
             pub = f"https://{pub}"
@@ -580,6 +625,7 @@ def start_tunnel() -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        start_new_session=True,
     )
     procs.append(p)
     pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
@@ -660,11 +706,16 @@ def run_maya(models_dir: Path, ram_resident: bool) -> int:
         "--api-key", MAYA_API_KEY,
     ]
 
-    if EXPERT_RAM_POLICY == "force_ram":
+    if ram_resident:
         if MODEL_PRESET.startswith("ds4-"):
             cmd.extend(["--env", "DS4_REQUIRE_ALL_RAM=1"])
         elif MODEL_PRESET.startswith("glm-"):
             cmd.extend(["--env", "MAYA_GLM_RAM_RESIDENT=1"])
+    elif EXPERT_RAM_POLICY == "allow_disk":
+        if MODEL_PRESET.startswith("ds4-"):
+            cmd.extend(["--env", "DS4_REQUIRE_ALL_RAM=0"])
+        elif MODEL_PRESET.startswith("glm-"):
+            cmd.extend(["--env", "MAYA_GLM_RAM_RESIDENT=0"])
 
     if MODEL_PRESET == "ds4-abliterated-128g":
         cmd.extend(["--model", "DeepSeek-V4.1-Flash-1017", "--ds4-quant", "abliterated-128g"])
@@ -686,12 +737,42 @@ def run_maya(models_dir: Path, ram_resident: bool) -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     procs.append(p)
-    assert p.stdout is not None
-    for line in p.stdout:
-        sys.stdout.write(line)
+
+    global _main_loop_active
+    _main_loop_active = True
+
+    def forward_maya() -> None:
+        assert p.stdout is not None
+        for line in p.stdout:
+            output_queue.put(line)
+        output_queue.put(None)
+
+    threading.Thread(target=forward_maya, daemon=True).start()
+
+    while True:
+        try:
+            item = output_queue.get(timeout=1.0)
+        except queue.Empty:
+            if p.poll() is not None:
+                break
+            continue
+        if item is None:
+            break
+        sys.stdout.write(item)
         sys.stdout.flush()
+
+    _main_loop_active = False
+    while not output_queue.empty():
+        try:
+            item = output_queue.get_nowait()
+            if item is not None:
+                sys.stdout.write(item)
+                sys.stdout.flush()
+        except queue.Empty:
+            break
     return p.wait()
 
 

@@ -23,7 +23,7 @@ The endgame for frontier LLM serving on Google Colab.
 - **云盘预查找 + 本地 NVMe 跑 Engram + 专家全内存锁页。** 在推荐的 `nvme_engram` 模式下，脚本启动先检索 Google Drive 是否已有缓存分片，把 161 GB `Engram-Q6_K` 顺序拉取到本地高速 `/content` NVMe SSD，缺失分片自动回退走 Hugging Face 公网下载；同时将 114 GB 主权重软链至云盘并在启动时一次性全量锁入显存与系统内存 (`--mmap-experts off`，见 [`project-maya` 内存文档](https://github.com/mw00/project-maya/blob/main/docs/MEMORY.md))。进入服务态后，专家层计算 100% 走内存，Engram 随机查表 100% 走本地 NVMe 与约 140 GB 系统页缓存，推理期零网盘 I/O。
 - **后台原子回存云盘。** 服务通过 `/health` 探测就绪后，后台线程按策略 (`both`、`weights_only`、`engram_only`、`none`) 将本次回退下载的新分片先写为 `.syncing.tmp` 再原子重命名同步回 Google Drive，中断退出绝不留半截脏文件。
 - **独立托管的 `uv` 隔离运行环境。** 安装脚本与 `colabd env setup` 会自动在 `~/.local/share/colabd-runtime/venv` 创建独立的 Python 3.12 虚拟环境并安装 `google-colab-cli`（若本机无 `uv`，自动安装至私有目录且不修改 shell 配置）。`colabd` 所有本地 Python 逻辑、`keyring` 多账号令牌管理、`colab` 命令与 SSH `ProxyCommand` 均统一运行在该隔离环境内，不受系统 Python 版本（如 macOS 3.9 / Ubuntu 22.04 3.10）、PEP 668、`conda`/`pyenv` shim 或 `PATH` 变动影响。
-- **内核保活与多账号系留回收。** 远端守护程序通过 `colab exec` 在 Jupyter 内核内运行以维持官方保活；本机注册 `EXIT`、`INT`、`TERM`、`HUP` 信号钩子，退出面板自动按实例归属账号调用 `colab stop`。针对官方 `google-colab-cli` 未提供 `logout` 子命令的问题，内置多账号槽位管理（OAuth 2.0 系统钥匙串多槽位 + 独立 `adc.json` + 隔离的 `sessions.json`），在切号、真登出或删除槽位前均会先拦截并释放旧账号活跃实例，并支持 `colabd down --all` 一键全局清理所有已保存账号的残留实例。
+- **内核保活与多账号系留回收。** 远端守护程序通过 `colab exec` 在 Jupyter 内核内运行以维持官方保活；本机注册 `EXIT`、`INT`、`TERM`、`HUP` 信号钩子，退出面板自动按实例归属账号调用 `colab stop`。针对官方 `google-colab-cli` 未提供 `logout` 子命令与细粒度授权漏勾权限域的问题，内置基于真实邮箱唯一去重的账号管理（`oauth2` 钥匙串 + 独立 `adc.json` + 隔离 `sessions.json`），支持必需 `Scopes` 校验与 `colabd auth refresh` 原地补齐权限；移除账号或登出时采用严格硬门禁（先探测并释放全部活跃实例且校验成功，失败则中止移除并保留凭证），并支持 `colabd down --all` 一键全局清理。
 
 ## 快速上手
 
@@ -73,17 +73,18 @@ colabd
 ```bash
 colabd                         # 启动交互式数字菜单控制台 (默认)
 colabd up                      # 直接拉起配置的 Colab 实例并进入控制台保活
-colabd auth                    # 打开多账号切换、真登出、全局释放与远端 GCP 授权中心
-colabd auth list               # 查看已保存账号槽位与各账号本地活跃会话
-colabd auth add [name]         # 新增并登录账号槽位 (支持 --oauth2 / --adc)
-colabd auth save [name]        # 将当前已登录账号归档为独立槽位
-colabd auth use <name>         # 释放当前账号活跃实例后一键秒切目标账号 (简写: colabd switch <name>)
-colabd auth logout             # 先释放活跃实例，再清除系统钥匙串 OAuth2 / ADC 凭证实现真登出
-colabd auth remove <name>      # 先释放目标账号活跃实例，再删除其槽位与凭证
+colabd auth                    # 打开账号管理、权限域校验与远端 GCP 授权中心
+colabd auth list               # 按唯一账号 ID (邮箱) 查看已登录账号、权限状态与活跃实例
+colabd auth login              # 登录新账号 (自动按邮箱去重 + 校验必需 Scopes，支持 --oauth2 / --adc)
+colabd auth refresh [id]       # 原地重新授权并补齐缺失权限域 (保留 sessions.json 与备注)
+colabd auth use <id>           # 释放当前账号活跃实例后一键秒切目标账号 (简写: colabd switch <id>)
+colabd auth note <id> <text>   # 编辑账号纯展示备注 (不改变唯一 ID)
+colabd auth remove <id>        # 失败关闭门禁释放活跃实例并核验后移除账号 (可选 --revoke / --force)
+colabd auth logout             # 安全释放并移除当前激活账号 (可选 --revoke / --force)
 colabd settings                # 打开本地持久化设置页
 colabd down                    # 立即销毁当前激活账号的活跃实例
-colabd down -a <name>          # 销毁指定已保存账号槽位的活跃实例
-colabd down --all              # 扫描并释放所有已保存账号的残留 Colab 实例
+colabd down -a <id>            # 销毁指定账号的活跃实例
+colabd down --all              # 扫描并释放所有账号的残留 Colab 实例
 colabd env [status|setup|upgrade|reset]
                                # 查看、初始化、升级或重建独立 uv Python 3.12 隔离环境
 colabd doctor                  # 等同于 colabd env status，诊断本地运行环境与依赖

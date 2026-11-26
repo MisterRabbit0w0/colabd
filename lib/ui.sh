@@ -15,26 +15,25 @@ page_account_auth() {
       cli_ver="$("$colab_bin" version 2>/dev/null | head -n 1 || echo "已安装")"
     fi
 
-    echo "${C_BOLD}${C_CYAN}================ Google Colab 多账号切换与 GCP 授权中心 ================${C_RESET}"
+    echo "${C_BOLD}${C_CYAN}================ Google Colab 账号管理与 GCP 授权中心 ================${C_RESET}"
     echo "  运行环境       : $(format_runtime_badge)"
     echo "  Colab CLI 版本 : ${cli_ver}"
-    echo "  当前激活槽位   : ${C_BOLD}$(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")${C_RESET}"
-    echo "  当前认证模式   : ${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} - $(auth_mode_desc "$COLAB_AUTH_MODE")"
-    echo "  当前登录状态   : $(format_auth_badge)"
+    echo "  当前登录账号   : ${C_BOLD}$(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")${C_RESET}"
+    echo "  当前认证状态   : $(format_auth_badge)"
     [[ -n "$AUTH_DETAIL" ]] && echo "  状态探测摘要   : ${AUTH_DETAIL}"
     echo "  远端 GCP 授权  : 启动实例时自动执行 colab auth = $( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "${C_GREEN}开启${C_RESET}" || echo "关闭" )"
     echo ""
-    echo "  ${C_BOLD}已保存账号槽位${C_RESET} (* 表示当前激活，各槽位拥有独立 sessions.json):"
+    echo "  ${C_BOLD}已登录账号列表${C_RESET} (* 当前激活，按邮箱唯一去重，独立隔离 sessions.json):"
     print_saved_accounts_table || true
     echo "${C_CYAN}------------------------------------------------------------------------${C_RESET}"
-    echo "  1) 刷新检测登录状态、当前邮箱与算力余额 (whoami / sessions / usage)"
-    echo "  2) 快速切换已保存的账号槽位 (带活跃实例释放保护 -> 一键秒切)"
-    echo "  3) 添加并登录新的 Google 账号槽位 (支持 OAuth 2.0 / gcloud ADC)"
-    echo "  4) 将当前已登录账号归档为槽位 / 更新当前槽位备份"
-    echo "  5) 删除已保存的账号槽位 (先释放该账号活跃实例再彻底清除)"
-    echo "  6) 彻底登出当前账号 (先释放活跃实例 -> 清除系统钥匙串 / ADC 凭证)"
-    echo "  7) 扫描并一键释放所有已保存账号的残留 Colab 实例 (全局防扣费清理)"
-    echo "  8) 远端 Colab 实例 GCP 服务授权 (colab auth) / 切换自动授权开关"
+    echo "  1) 刷新检测当前账号登录态、权限域 (Scopes) 与算力余额"
+    echo "  2) 切换账号 (带防扣费释放保护 -> 一键秒切)"
+    echo "  3) 登录 / 添加 Google 账号 (自动识别邮箱去重 + 校验必需权限域)"
+    echo "  4) 重新授权 / 补齐账号权限域 (auth refresh，不丢会话记录)"
+    echo "  5) 编辑账号备注 (纯展示标签，不改变唯一账号 ID)"
+    echo "  6) 移除账号 / 登出 (前置探测 + 强制释放活跃实例成功后再清凭证)"
+    echo "  7) 扫描并一键释放所有账号的残留 Colab 实例 (全局防扣费清理)"
+    echo "  8) 远端 Colab 实例 GCP 服务授权 (colab auth) / 切换启动自动授权"
     echo "  9) 初始化 / 升级独立 uv 隔离环境 (Python ${COLABD_PYTHON_VERSION} + google-colab-cli)"
     echo "  0) 返回上级菜单"
     echo "${C_CYAN}========================================================================${C_RESET}"
@@ -44,13 +43,17 @@ page_account_auth() {
       1)
         echo ""
         if refresh_colab_auth_status 6 1; then
-          echo "${C_GREEN}[有效] 当前账号已正常登录: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")${C_RESET}"
+          echo "${C_GREEN}[有效] 当前账号已正常登录: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")${C_RESET}"
           echo "${C_DIM}--- colab whoami ---${C_RESET}"
           colab_cli whoami 2>&1 | sed 's/^/  /' || true
           echo "${C_DIM}--- colab sessions ---${C_RESET}"
           colab_cli sessions 2>&1 | sed 's/^/  /' || true
           echo "${C_DIM}--- colab usage ---${C_RESET}"
           colab_cli usage 2>&1 | sed 's/^/  /' || true
+        elif [[ "$AUTH_STATE" == "insufficient_scope" ]]; then
+          echo "${C_RED}[权限域不足] ${AUTH_DETAIL}${C_RESET}"
+          echo "${C_DIM}--- colab whoami ---${C_RESET}"
+          colab_cli whoami 2>&1 | sed 's/^/  /' || true
         else
           echo "${C_YELLOW}[未授权] ${AUTH_DETAIL}${C_RESET}"
         fi
@@ -61,19 +64,25 @@ page_account_auth() {
         read -r -p "按回车继续..." _
         ;;
       3)
-        do_add_new_account "" "" "prompt" || true
+        do_login_account "" "" "prompt" || true
         read -r -p "按回车继续..." _
         ;;
       4)
-        do_save_current_account "" || true
+        echo ""
+        local ref_q=""
+        if [[ -n "$ACTIVE_ACCOUNT" ]]; then
+          print_saved_accounts_table || true
+          read -r -p "输入要重新授权/补齐权限的账号 ID [回车默认当前 ${ACTIVE_ACCOUNT}]: " ref_q
+        fi
+        do_refresh_account "$ref_q" "1" || true
         read -r -p "按回车继续..." _
         ;;
       5)
-        do_delete_account "" "prompt" || true
+        do_edit_account_note "" "__UNSET__" || true
         read -r -p "按回车继续..." _
         ;;
       6)
-        do_colab_logout "prompt" "1" || true
+        do_remove_account "" "prompt" "1" || true
         read -r -p "按回车继续..." _
         ;;
       7)
@@ -84,9 +93,7 @@ page_account_auth() {
         echo ""
         echo "  1) 立即为当前运行中的远端实例执行 GCP 授权 (colab auth)"
         echo "  2) 切换【启动实例时自动执行 colab auth】开关 (当前: $( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" ))"
-        echo "  3) 直接拉起 Google OAuth 2.0 登录 (不新建槽位)"
-        echo "  4) 直接拉起 GCP ADC 登录 (不新建槽位)"
-        read -r -p "请选择 [1-4，回车取消]: " g_opt
+        read -r -p "请选择 [1-2，回车取消]: " g_opt
         case "${g_opt:-}" in
           1) do_remote_gcp_auth ;;
           2)
@@ -94,13 +101,11 @@ page_account_auth() {
             save_config
             echo "${C_GREEN}[已更新] 启动自动 colab auth = $( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" )${C_RESET}"
             ;;
-          3) do_oauth2_login || true ;;
-          4) do_adc_login || true ;;
         esac
         read -r -p "按回车继续..." _
         ;;
       9)
-        do_install_or_update_cli
+        do_install_or_update_cli || true
         read -r -p "按回车继续..." _
         ;;
       0|"") break ;;
@@ -162,7 +167,7 @@ page_status() {
     echo "${C_BOLD}[Colab 会话状态 & 算力单元消耗 (colab status / colab usage)]${C_RESET}"
     if [[ "$AUTH_STATE" == "ok" ]]; then
       local target="${ACTIVE_SESSION_NAME:-$SESSION_NAME}"
-      echo "${C_DIM}--- colab status -s ${target} ($(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")) ---${C_RESET}"
+      echo "${C_DIM}--- colab status -s ${target} ($(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")) ---${C_RESET}"
       colab_cli status -s "$target" 2>&1 | sed 's/^/  /' || echo "  (当前无活跃会话记录)"
       echo "${C_DIM}--- colab usage ---${C_RESET}"
       colab_cli usage 2>&1 | sed 's/^/  /' || echo "  (无法获取算力单元用量)"
@@ -243,7 +248,7 @@ page_settings() {
     echo "  9) HuggingFace Token: $(mask_secret "$HF_TOKEN") (orcarouter 去审查版必填)"
     echo "  10) API Key 与端口  : Key=$(mask_secret "$MAYA_API_KEY") | 端口=${MAYA_PORT} | 本地绑定=${LOCAL_BIND}"
     echo "  11) 上下文与界面开关: ${MAYA_CONTEXT} tok | 视觉=$( [[ "$NO_VISION" == "0" ]] && echo "开" || echo "关" ) | Web面板=$( [[ "$WEB_UI" == "1" ]] && echo "开" || echo "仅API" )"
-    echo "  12) Colab 账号与认证: 槽位=${C_GREEN}${ACTIVE_ACCOUNT:-(未归档)}${C_RESET} | 模式=${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} | 启动自动 colab auth=$( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" )"
+    echo "  12) Colab 账号与认证: 账号=${C_GREEN}${ACTIVE_ACCOUNT:-(未登录)}${C_RESET} | 模式=${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} | 启动自动 colab auth=$( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" )"
     echo "  13) 恢复默认设置"
     echo "  0) 返回主菜单"
     echo "${C_CYAN}================================================================================${C_RESET}"
@@ -392,9 +397,23 @@ page_settings() {
           2) read -r -p "输入新 API Key: " nk; [[ -n "$nk" ]] && MAYA_API_KEY="$nk" ;;
         esac
         read -r -p "服务端口 [当前: ${MAYA_PORT}]: " np
-        MAYA_PORT="${np:-$MAYA_PORT}"
+        if [[ -n "$np" ]]; then
+          if [[ "$np" =~ ^[0-9]+$ && "$np" -ge 1 && "$np" -le 65535 ]]; then
+            MAYA_PORT="$np"
+          else
+            echo "${C_RED}[忽略] 端口 '${np}' 无效（需为 1-65535）。${C_RESET}"
+            sleep 1
+          fi
+        fi
         read -r -p "SSH 模式本地绑定地址 (127.0.0.1 或 0.0.0.0) [当前: ${LOCAL_BIND}]: " nb
-        LOCAL_BIND="${nb:-$LOCAL_BIND}"
+        if [[ -n "$nb" ]]; then
+          if [[ "$nb" =~ ^[A-Za-z0-9.:_-]+$ ]]; then
+            LOCAL_BIND="$nb"
+          else
+            echo "${C_RED}[忽略] 绑定地址 '${nb}' 含非法字符。${C_RESET}"
+            sleep 1
+          fi
+        fi
         save_config
         ;;
       11)
@@ -408,7 +427,14 @@ page_settings() {
           4) MAYA_CONTEXT="262144" ;;
         esac
         read -r -p "Colab 会话名称 [当前: ${SESSION_NAME}]: " nsess
-        SESSION_NAME="${nsess:-$SESSION_NAME}"
+        if [[ -n "$nsess" ]]; then
+          if [[ "$nsess" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            SESSION_NAME="$nsess"
+          else
+            echo "${C_RED}[忽略] 会话名称 '${nsess}' 仅允许字母、数字、.、_、-。${C_RESET}"
+            sleep 1
+          fi
+        fi
         read -r -p "是否开启多模态图片输入编码器? [Y/n]: " vis
         if [[ "${vis:-Y}" =~ ^[Nn]$ ]]; then NO_VISION="1"; else NO_VISION="0"; fi
         read -r -p "是否开启浏览器 Web 聊天与监控面板 (选 n 则仅保留纯 API)? [Y/n]: " wui
@@ -425,9 +451,10 @@ page_settings() {
         case "${ca_idx:-4}" in
           1)
             if [[ "$COLAB_AUTH_MODE" != "oauth2" ]]; then
-              if guard_release_before_account_change "切换认证策略为 oauth2" "" "prompt" "0"; then
+              if guard_release_before_account_change "切换认证策略为 oauth2" "" "prompt"; then
                 ACTIVE_ACCOUNT=""
                 AUTH_EMAIL=""
+                AUTH_NOTE=""
                 COLAB_AUTH_MODE="oauth2"
                 save_config
                 refresh_colab_auth_status 4 0 || true
@@ -436,9 +463,10 @@ page_settings() {
             ;;
           2)
             if [[ "$COLAB_AUTH_MODE" != "adc" ]]; then
-              if guard_release_before_account_change "切换认证策略为 adc" "" "prompt" "0"; then
+              if guard_release_before_account_change "切换认证策略为 adc" "" "prompt"; then
                 ACTIVE_ACCOUNT=""
                 AUTH_EMAIL=""
+                AUTH_NOTE=""
                 COLAB_AUTH_MODE="adc"
                 save_config
                 refresh_colab_auth_status 4 0 || true
@@ -453,12 +481,16 @@ page_settings() {
         esac
         ;;
       13)
-        read -r -p "确认清空并恢复所有默认设置 (已保存的多账号槽位将保留)? [y/N]: " yn
+        read -r -p "确认清空并恢复所有默认设置 (已保存的多账号将保留)? [y/N]: " yn
         if [[ "${yn:-N}" =~ ^[Yy]$ ]]; then
           local keep_acct="$ACTIVE_ACCOUNT"
+          local keep_mode="$COLAB_AUTH_MODE"
+          local keep_adopt="$AUTO_ADOPT_EXTERNAL"
           HF_TOKEN=""
           reset_defaults
           ACTIVE_ACCOUNT="$keep_acct"
+          COLAB_AUTH_MODE="$keep_mode"
+          AUTO_ADOPT_EXTERNAL="$keep_adopt"
           save_config
           refresh_colab_auth_status 4 0 || true
         fi
@@ -503,7 +535,7 @@ run_interactive_loop() {
     echo "  3) 实时查看远端分片拉取、编译与推理日志 (Ctrl+C 返回菜单)"
     echo "  4) 一键发送流式对话测试请求 (curl /v1/chat/completions)"
     echo "  5) 设置页 (切换模型 / 存储拓扑 / 云盘查找与回存策略 / 隧道，自动保存)"
-    echo "  6) Colab 多账号切换与授权中心 (一键秒切 / 增删槽位 / 真登出 / 全局释放)"
+    echo "  6) Colab 账号管理与授权中心 (登录去重 / 秒切 / 权限补齐 / 安全移除 / 全局释放)"
     echo "  7) 手动销毁当前 Colab 实例 (保持面板打开以便修改配置重开)"
     echo "  0) 退出面板 (自动执行 colab stop 回收实例与释放算力)"
     echo "${C_CYAN}=========================================================================${C_RESET}"
@@ -532,8 +564,8 @@ run_interactive_loop() {
         local other_sessions=""
         if other_sessions="$(find_other_accounts_with_local_sessions 2>/dev/null)"; then
           echo ""
-          echo "${C_YELLOW}[防扣费提醒] 检测到其他已保存账号槽位仍有未释放的本地会话记录: ${other_sessions}${C_RESET}"
-          read -r -p "是否在退出前一并扫描释放所有已保存账号的残留实例? [Y/n]: " rel_all_yn
+          echo "${C_YELLOW}[防扣费提醒] 检测到其他已登录账号仍有未释放的本地会话记录: ${other_sessions}${C_RESET}"
+          read -r -p "是否在退出前一并扫描释放所有账号的残留实例? [Y/n]: " rel_all_yn
           if [[ ! "${rel_all_yn:-Y}" =~ ^[Nn]$ ]]; then
             release_all_accounts_runtimes "0" || true
           fi

@@ -21,13 +21,32 @@ if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
   fi
 fi
 
+while [[ "$INSTALL_HOME" != "/" && "$INSTALL_HOME" == */ ]]; do
+  INSTALL_HOME="${INSTALL_HOME%/}"
+done
+if [[ -z "$INSTALL_HOME" || "$INSTALL_HOME" == "/" ]]; then
+  echo "[ERROR] Invalid COLABD_HOME: '${INSTALL_HOME}'" >&2
+  exit 1
+fi
+
 mkdir -p "$BIN_DIR" "$(dirname "$INSTALL_HOME")"
+if [[ -d "$INSTALL_HOME" ]]; then
+  INSTALL_REAL="$(cd -P "$INSTALL_HOME" && pwd)"
+else
+  INSTALL_REAL="$(cd -P "$(dirname "$INSTALL_HOME")" && pwd)/$(basename "$INSTALL_HOME")"
+fi
 
 if [[ -n "$LOCAL_ROOT" ]]; then
-  echo "[colabd] Installing from local checkout: ${LOCAL_ROOT}"
-  rm -rf "$INSTALL_HOME"
-  mkdir -p "$INSTALL_HOME"
-  cp -R "${LOCAL_ROOT}/bin" "${LOCAL_ROOT}/lib" "${LOCAL_ROOT}/scripts" "$INSTALL_HOME/"
+  if [[ "$INSTALL_REAL" == "$LOCAL_ROOT" ]]; then
+    echo "[colabd] Using existing local checkout in-place: ${LOCAL_ROOT}"
+  else
+    echo "[colabd] Installing from local checkout: ${LOCAL_ROOT}"
+    rm -rf "$INSTALL_HOME"
+    mkdir -p "$INSTALL_HOME"
+    cp -R "${LOCAL_ROOT}/bin" "${LOCAL_ROOT}/lib" "${LOCAL_ROOT}/scripts" "$INSTALL_HOME/"
+    find "${INSTALL_HOME}/lib" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+    find "${INSTALL_HOME}/lib" -type f -name '*.pyc' -exec rm -f {} + 2>/dev/null || true
+  fi
 else
   if ! command -v git >/dev/null 2>&1; then
     echo "[ERROR] git is required for remote installation." >&2

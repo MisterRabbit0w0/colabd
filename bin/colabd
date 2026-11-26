@@ -44,22 +44,24 @@ The endgame for frontier LLM serving on Google Colab.
 Usage:
   colabd                                  Launch the interactive TUI control panel (default)
   colabd up                               Start the configured Colab runtime and enter the TUI tether
-  colabd auth                             Open the interactive multi-account & GCP auth center
-  colabd auth list                        List saved account profiles and local active sessions
-  colabd auth whoami                      Show active profile, email, sessions, and compute usage
-  colabd auth use <name> [--release|-y|--keep]
+  colabd auth                             Open the interactive account management & GCP auth center
+  colabd auth list                        List logged-in accounts (deduped by email), scope status & sessions
+  colabd auth whoami                      Show active account ID, granted scopes, sessions & compute usage
+  colabd auth login [--oauth2|--adc] [--note TEXT] [--release|-y]
+                                          Log in a Google account (auto-dedup by email + strict scope check)
+  colabd auth use <id> [--release|-y|--keep]
                                           Release active runtime (with guard) and switch account
-  colabd auth add [name] [--oauth2|--adc] [--release|-y]
-                                          Add and authenticate a new account profile
-  colabd auth save [name]                 Archive the current login into a named account profile
-  colabd auth remove <name> [--release|-y]
-                                          Release target account runtimes and delete its profile
-  colabd auth logout [--release|-y]       Release active runtime and clear local keyring/ADC tokens
-  colabd switch <name> [--release|-y|--keep]
-                                          Shortcut for 'colabd auth use <name>'
+  colabd auth refresh [id]                Re-authorize in-place to repair missing scopes or expired tokens
+  colabd auth note <id> <text...>         Set or clear an optional display note for an account
+  colabd auth remove <id> [--release|-y] [--revoke] [--force]
+                                          Fail-closed release of active runtimes, then remove account
+  colabd auth logout [--release|-y] [--revoke] [--force]
+                                          Safely release & remove the currently active account
+  colabd switch <id> [--release|-y|--keep]
+                                          Shortcut for 'colabd auth use <id>'
   colabd down                             Stop active runtime(s) on the current account
-  colabd down -a|--account <name>         Stop active runtime(s) on a specific saved account
-  colabd down --all                       Scan and release active runtimes across ALL saved accounts
+  colabd down -a|--account <id>           Stop active runtime(s) on a specific account
+  colabd down --all                       Scan and release active runtimes across ALL accounts
   colabd env [status|setup|upgrade|reset] Manage colabd's isolated uv Python 3.12 + colab CLI runtime
   colabd doctor                           Alias for 'colabd env status'
   colabd settings                         Open the persistent configuration menu
@@ -68,13 +70,14 @@ Usage:
 
 Configuration & Runtime:
   ${CONFIG_FILE} (mode 0600)
-  ${ACCOUNTS_DIR}/<alias>/ (isolated sessions.json & metadata, mode 0700/0600)
+  ${ACCOUNTS_DIR}/ (identity-keyed accounts with isolated sessions.json, mode 0700/0600)
   ${COLABD_VENV_DIR} (managed isolated uv Python ${COLABD_PYTHON_VERSION} venv)
 
 Lifecycle safety:
-  Exiting the interactive session, pressing Ctrl+C, switching accounts, logging out,
-  or deleting a profile automatically triggers orphan-runtime protection ('colab stop')
-  against the exact owning account so GPU Compute Units do not burn in the background.
+  Accounts are uniquely keyed by email + auth mode (no duplicate slots). Removing an
+  account requires zero running local daemons and verified release of all tracked
+  Colab runtimes; if release or remote verification fails, deletion aborts and local
+  credentials stay intact unless --force is explicitly passed.
 EOF
 }
 
@@ -88,17 +91,21 @@ handle_auth_cli() {
 
   case "$action" in
     list|ls)
-      echo "已保存的 Google Colab 账号槽位 (当前激活: ${ACTIVE_ACCOUNT:-无}):"
+      echo "已登录的 Google Colab 账号 (当前激活: ${ACTIVE_ACCOUNT:-无}):"
       print_saved_accounts_table || true
       return 0
       ;;
     whoami|status)
       if refresh_colab_auth_status 6 1; then
-        echo "当前账号: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")"
+        echo "当前账号: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")"
         colab_cli whoami 2>&1 || true
         colab_cli sessions 2>&1 || true
         colab_cli usage 2>&1 || true
         return 0
+      elif [[ "$AUTH_STATE" == "insufficient_scope" ]]; then
+        echo "[权限域不足] ${AUTH_DETAIL}" >&2
+        colab_cli whoami 2>&1 || true
+        return 1
       else
         echo "当前未登录或令牌失效: ${AUTH_DETAIL}" >&2
         return 1
@@ -125,40 +132,88 @@ handle_auth_cli() {
       do_switch_account "$target" "$mode"
       return $?
       ;;
-    add|login)
-      local alias=""
+    login|add)
       local auth_m=""
+      local note=""
       local mode="prompt"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --oauth2)           auth_m="oauth2" ;;
           --adc)              auth_m="adc" ;;
+          --note)
+            if [[ $# -lt 2 ]]; then
+              echo "[ERROR] Missing note text after --note" >&2
+              return 1
+            fi
+            note="$2"
+            shift
+            ;;
+          --note=*)
+            note="${1#--note=}"
+            ;;
           --release|-y|--yes) mode="release" ;;
           -*)
-            echo "[ERROR] Unknown option for 'colabd auth add': $1" >&2
+            echo "[ERROR] Unknown option for 'colabd auth login': $1" >&2
             return 1
             ;;
           *)
-            alias="$1"
+            note="$1"
             ;;
         esac
         shift
       done
       refresh_colab_auth_status 4 0 || true
-      do_add_new_account "$alias" "$auth_m" "$mode"
+      do_login_account "$auth_m" "$note" "$mode"
       return $?
       ;;
-    save)
-      local alias="${1:-}"
-      do_save_current_account "$alias"
+    refresh|reauth)
+      local target=""
+      local interactive="1"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --non-interactive|-y|--yes) interactive="0" ;;
+          -*)
+            echo "[ERROR] Unknown option for 'colabd auth refresh': $1" >&2
+            return 1
+            ;;
+          *)
+            target="$1"
+            ;;
+        esac
+        shift
+      done
+      refresh_colab_auth_status 4 0 || true
+      do_refresh_account "$target" "$interactive"
+      return $?
+      ;;
+    note)
+      local target="${1:-}"
+      if [[ -z "$target" ]]; then
+        echo "[ERROR] Usage: colabd auth note <account-id> <text...>" >&2
+        return 1
+      fi
+      shift
+      local text="__UNSET__"
+      if [[ $# -gt 0 ]]; then
+        text="$*"
+      fi
+      do_edit_account_note "$target" "$text"
       return $?
       ;;
     remove|rm|delete)
       local target=""
       local mode="prompt"
+      local revoke_remote="0"
+      local force_unverified="0"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --release|-y|--yes) mode="release" ;;
+          --revoke)           revoke_remote="1" ;;
+          --force)            force_unverified="1" ;;
+          --keep)
+            echo "[ERROR] Removing an account with --keep is forbidden to prevent orphaned GPUs. Use 'colabd switch' instead." >&2
+            return 1
+            ;;
           -*)
             echo "[ERROR] Unknown option for 'colabd auth remove': $1" >&2
             return 1
@@ -170,15 +225,22 @@ handle_auth_cli() {
         shift
       done
       refresh_colab_auth_status 4 0 || true
-      do_delete_account "$target" "$mode"
+      do_remove_account "$target" "$mode" "0" "$revoke_remote" "$force_unverified"
       return $?
       ;;
     logout)
       local mode="prompt"
+      local revoke_remote="0"
+      local force_unverified="0"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --release|-y|--yes) mode="release" ;;
-          --keep)             mode="keep" ;;
+          --revoke)           revoke_remote="1" ;;
+          --force)            force_unverified="1" ;;
+          --keep)
+            echo "[ERROR] Logging out with --keep is forbidden to prevent orphaned GPUs. Release first or use 'colabd switch'." >&2
+            return 1
+            ;;
           -*)
             echo "[ERROR] Unknown option for 'colabd auth logout': $1" >&2
             return 1
@@ -187,7 +249,7 @@ handle_auth_cli() {
         shift
       done
       refresh_colab_auth_status 4 0 || true
-      do_colab_logout "$mode" "0"
+      do_logout_current_account "$mode" "0" "$revoke_remote" "$force_unverified"
       return $?
       ;;
     *)
@@ -208,7 +270,7 @@ handle_down_cli() {
         ;;
       -a|--account)
         if [[ $# -lt 2 ]]; then
-          echo "[ERROR] Missing account name after $1" >&2
+          echo "[ERROR] Missing account ID after $1" >&2
           return 1
         fi
         target_account="$2"
@@ -236,16 +298,15 @@ handle_down_cli() {
   fi
 
   refresh_colab_auth_status 4 0 || true
-  local sess_cfg
+  local sess_cfg=""
   sess_cfg="$(colab_session_config_path "$ACTIVE_ACCOUNT")"
   local has_local=""
   has_local="$(account_store sessions-list "$sess_cfg" 2>/dev/null || true)"
-  if [[ -n "$has_local" ]]; then
+  if [[ -n "$has_local" ]] || { [[ "$AUTH_STATE" == "ok" ]] && colab_session_is_active "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$SESSION_NAME"; }; then
     stop_colab_instance
-  else
-    MANAGED_SESSION=1
-    stop_colab_instance
+    return $?
   fi
+  echo "${C_DIM}[提示] 当前账号 ($(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")) 无活跃 Colab 实例。${C_RESET}"
   return 0
 }
 
@@ -281,8 +342,8 @@ handle_env_cli() {
 }
 
 main() {
-  load_config
   local sub="${1:-}"
+  # Handle pure informational commands BEFORE load_config so --help / --version never write config.env!
   case "$sub" in
     -h|--help|help)
       COLABD_SKIP_AUTO_STOP=1
@@ -294,6 +355,10 @@ main() {
       echo "colabd ${COLABD_VERSION}"
       exit 0
       ;;
+  esac
+
+  load_config
+  case "$sub" in
     up)
       action_start_or_restart
       run_interactive_loop

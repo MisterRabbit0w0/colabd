@@ -180,7 +180,7 @@ format_runtime_badge() {
       echo "${C_YELLOW}○ 外部 colab CLI${C_RESET} (${ext_bin} — 建议运行 'colabd env setup' 切换至独立 uv 环境)"
       ;;
     *)
-      echo "${C_RED}✗ 尚未初始化独立 uv 环境${C_RESET} (请运行 'colabd env setup' 或选菜单 [9])"
+      echo "${C_RED}✗ 尚未初始化独立 uv 环境${C_RESET} (请运行 'colabd env setup' 或选菜单 [6]->[9])"
       ;;
   esac
 }

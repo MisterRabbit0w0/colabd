@@ -25,13 +25,21 @@ ACTIVE_SESSION_HAS_OWNER=0
 ACTIVE_SESSION_ACCOUNT=""
 ACTIVE_SESSION_AUTH_MODE=""
 
-# Auth probe cache: missing_cli | unauth | ok | unknown
+# Signal-safe OAuth2 keyring swap recovery state (restored by cleanup_on_exit on Ctrl+C)
+OAUTH_SWAP_ACTIVE=0
+OAUTH_SWAP_BACKUP_FILE=""
+OAUTH_SWAP_HAD_PREV=0
+
+# Auth probe cache: missing_cli | unauth | insufficient_scope | ok | unknown
 AUTH_STATE="unknown"
 AUTH_DETAIL=""
 AUTH_EMAIL=""
-LAST_GUARD_KEPT_REMOTE=0
+AUTH_NOTE=""
+AUTH_MISSING_REQ_SCOPES=""
+AUTH_MISSING_OPT_SCOPES=""
 
 ADC_SCOPES="openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory"
+FIELD_SEP=$'\037'
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RESET=$'\033[0m'
@@ -55,8 +63,9 @@ generate_api_key() {
 
 reset_defaults() {
   SESSION_NAME="colabd-llm"
-  ACTIVE_ACCOUNT=""                            # Saved profile alias under ~/.config/colabd/accounts/<alias>
+  ACTIVE_ACCOUNT=""                            # Canonical account ID: <email> (oauth2) or adc:<email> (adc)
   COLAB_AUTH_MODE="oauth2"                     # oauth2 | adc
+  AUTO_ADOPT_EXTERNAL="1"                      # 1: auto-adopt pre-existing external login; 0 after explicit logout/remove
   AUTO_GCP_AUTH="0"                            # 1: run `colab auth` on session start
   GPU_TYPE="G4"                                # G4 (RTX PRO 6000 96GB) | H100 | A100 | L4 | T4
   HIGH_MEM="1"                                 # 1: pass --high-mem, 0: standard RAM
@@ -94,6 +103,7 @@ save_config() {
       printf 'SESSION_NAME=%q\n' "$SESSION_NAME"
       printf 'ACTIVE_ACCOUNT=%q\n' "$ACTIVE_ACCOUNT"
       printf 'COLAB_AUTH_MODE=%q\n' "$COLAB_AUTH_MODE"
+      printf 'AUTO_ADOPT_EXTERNAL=%q\n' "$AUTO_ADOPT_EXTERNAL"
       printf 'AUTO_GCP_AUTH=%q\n' "$AUTO_GCP_AUTH"
       printf 'GPU_TYPE=%q\n' "$GPU_TYPE"
       printf 'HIGH_MEM=%q\n' "$HIGH_MEM"
@@ -142,22 +152,38 @@ load_config() {
   fi
 }
 
+account_dir_path() {
+  local acct="${1-}"
+  [[ -z "$acct" ]] && return 1
+  account_store path "$ACCOUNTS_DIR" "$acct" 2>/dev/null
+}
+
 colab_session_config_path() {
   local acct="${1-}"
   if [[ -n "$acct" ]]; then
-    echo "${ACCOUNTS_DIR}/${acct}/sessions.json"
-  else
-    echo "${COLAB_CLI_CONFIG_DIR}/sessions.json"
+    local pdir=""
+    if pdir="$(account_dir_path "$acct")"; then
+      echo "${pdir}/sessions.json"
+      return 0
+    fi
   fi
+  echo "${COLAB_CLI_CONFIG_DIR}/sessions.json"
 }
 
+# Strictly resolves ADC credentials path.
+# When an explicit managed account ID is supplied, NEVER silently falls back to host global ADC!
 colab_adc_credentials_path() {
   local acct="${1-}"
-  if [[ -n "$acct" && -f "${ACCOUNTS_DIR}/${acct}/adc.json" ]]; then
-    echo "${ACCOUNTS_DIR}/${acct}/adc.json"
-  else
-    echo "${GOOGLE_APPLICATION_CREDENTIALS:-${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}/application_default_credentials.json}"
+  if [[ -n "$acct" ]]; then
+    local pdir=""
+    if pdir="$(account_dir_path "$acct")" && [[ -f "${pdir}/adc.json" ]]; then
+      echo "${pdir}/adc.json"
+      return 0
+    fi
+    return 1
   fi
+  echo "${GOOGLE_APPLICATION_CREDENTIALS:-${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}/application_default_credentials.json}"
+  return 0
 }
 
 colab_cli_for() {
@@ -182,8 +208,11 @@ colab_cli_for() {
   fi
 
   local adc_override=""
-  if [[ "$auth_mode" == "adc" && -n "$acct" && -f "${ACCOUNTS_DIR}/${acct}/adc.json" ]]; then
-    adc_override="${ACCOUNTS_DIR}/${acct}/adc.json"
+  if [[ "$auth_mode" == "adc" && -n "$acct" ]]; then
+    if ! adc_override="$(colab_adc_credentials_path "$acct")"; then
+      echo "${C_RED}[错误] 账号 '${acct}' 缺少本地 ADC 凭证文件 (adc.json)，已拒绝回退至宿主机全局 ADC（防止串号）。请运行 'colabd auth refresh ${acct}'。${C_RESET}" >&2
+      return 1
+    fi
   fi
 
   if [[ -n "$adc_override" && -n "$sess_cfg" ]]; then
@@ -204,19 +233,15 @@ colab_cli() {
 format_account_label() {
   local acct="${1-}"
   local mode="${2:-$COLAB_AUTH_MODE}"
-  local email="${3-}"
+  local note="${3-}"
   if [[ -n "$acct" ]]; then
-    if [[ -n "$email" ]]; then
-      echo "${acct} (${email} | ${mode})"
+    if [[ -n "$note" ]]; then
+      echo "${acct} (${mode} | ${note})"
     else
       echo "${acct} (${mode})"
     fi
   else
-    if [[ -n "$email" ]]; then
-      echo "默认未归档账号 (${email} | ${mode})"
-    else
-      echo "默认未归档账号 (${mode})"
-    fi
+    echo "未登录 (${mode})"
   fi
 }
 
@@ -304,14 +329,6 @@ tunnel_desc() {
     cf_named) echo "Cloudflare 固定域名隧道 (${CF_PUBLIC_HOSTNAME:-已配 Token})" ;;
     ssh)      echo "Colab 官方 WebSocket SSH 端口转发 (http://${LOCAL_BIND}:${MAYA_PORT})" ;;
     *)        echo "$1" ;;
-  esac
-}
-
-auth_mode_desc() {
-  case "$1" in
-    oauth2) echo "Google OAuth 2.0 个人账号授权 (默认)" ;;
-    adc)    echo "GCP Application Default Credentials (gcloud ADC)" ;;
-    *)      echo "$1" ;;
   esac
 }
 
