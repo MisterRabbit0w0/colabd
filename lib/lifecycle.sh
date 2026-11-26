@@ -838,6 +838,7 @@ cleanup_on_exit() {
 build_remote_runner() {
   local effective_storage="$1"
   local effective_drive_write="${2:-$DRIVE_WRITE_MODE}"
+  local remote_port="${3:-$MAYA_PORT}"
   local host_py=""
   host_py="$(resolve_host_python 2>/dev/null || command -v python3)"
   local eff_engine=""
@@ -847,7 +848,7 @@ build_remote_runner() {
 
   "$host_py" - \
     "$eff_engine" "$MODEL_PRESET" "$spec_json" \
-    "$MAYA_CONTEXT" "$MAYA_DRAFTING" "$MAYA_PORT" \
+    "$MAYA_CONTEXT" "$MAYA_DRAFTING" "$MAYA_PORT" "$remote_port" \
     "$STRATA_KV_FORMAT" "$STRATA_PARALLEL" "$STRATA_BUILD_FALLBACK" \
     "$MAYA_ABLATION" "$MAYA_ABLATE_DEFAULT" \
     "$effective_storage" "$HF_DOWNLOAD_CONCURRENCY" "$effective_drive_write" "$EXPERT_RAM_POLICY" \
@@ -860,7 +861,7 @@ import sys
 
 keys = [
     "engine_type", "model_preset", "model_spec_json",
-    "maya_context", "maya_drafting", "maya_port",
+    "maya_context", "maya_drafting", "maya_port", "remote_port",
     "strata_kv_format", "strata_parallel", "strata_build_fallback",
     "maya_ablation", "maya_ablate_default",
     "storage_mode", "hf_download_concurrency", "drive_write_mode", "expert_ram_policy",
@@ -878,6 +879,44 @@ print(f"CONFIG = {repr(cfg)}\n")
 PYCFG
 
   cat "${COLABD_LIB_DIR}/remote_supervisor.py" >> "$RUNNER_PY"
+}
+
+probe_remote_free_port() {
+  local sess="$1"
+  local preferred_port="${2:-$MAYA_PORT}"
+  local probe_py="${STATE_DIR}/probe_port.$$.py"
+  cat > "$probe_py" <<PYPORT
+import os, socket, subprocess
+
+preferred = int("${preferred_port}")
+strata_bin = "/content/strata-bin/strata"
+if os.path.isfile(strata_bin):
+    try:
+        subprocess.run([strata_bin, "launch", "--stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        pass
+
+for port in range(preferred, min(65536, preferred + 128)):
+    busy = False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.4):
+            busy = True
+    except OSError:
+        pass
+    if busy:
+        continue
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", port))
+        print(port)
+        break
+    except OSError:
+        continue
+PYPORT
+  local out=""
+  out="$(probe_colab_command "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" 25 exec -s "$sess" -f "$probe_py" 2>/dev/null || true)"
+  rm -f "$probe_py"
+  printf '%s\n' "$out" | tr -d '\r' | grep -E '^[0-9]+$' | tail -n 1
 }
 
 probe_remote_local_free_gb() {
@@ -1174,6 +1213,16 @@ action_start_or_restart() {
     fi
   fi
 
+  local remote_port="$MAYA_PORT"
+  local probed_port=""
+  probed_port="$(probe_remote_free_port "$SESSION_NAME" "$MAYA_PORT" || true)"
+  if [[ -n "$probed_port" && "$probed_port" =~ ^[0-9]+$ && "$probed_port" -ge 1 && "$probed_port" -le 65535 ]]; then
+    if [[ "$probed_port" != "$MAYA_PORT" ]]; then
+      echo "${C_YELLOW}[端口避让] 远端端口 ${MAYA_PORT} 已被占用（如 Colab 运行时内置服务），远端引擎将改用空闲端口 ${probed_port}。${C_RESET}"
+    fi
+    remote_port="$probed_port"
+  fi
+
   if [[ "$TUNNEL_MODE" == "ssh" ]]; then
     local colab_bin=""
     colab_bin="$(resolve_colab_bin)"
@@ -1210,7 +1259,7 @@ action_start_or_restart() {
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
           -o ServerAliveInterval=30 \
-          -N -L "${LOCAL_BIND}:${MAYA_PORT}:127.0.0.1:${MAYA_PORT}" \
+          -N -L "${LOCAL_BIND}:${MAYA_PORT}:127.0.0.1:${remote_port}" \
           root@colab >"$SSH_LOG" 2>&1 &
     else
       ssh \
@@ -1220,13 +1269,13 @@ action_start_or_restart() {
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ServerAliveInterval=30 \
-        -N -L "${LOCAL_BIND}:${MAYA_PORT}:127.0.0.1:${MAYA_PORT}" \
+        -N -L "${LOCAL_BIND}:${MAYA_PORT}:127.0.0.1:${remote_port}" \
         root@colab >"$SSH_LOG" 2>&1 &
     fi
     SSH_PID=$!
   fi
 
-  build_remote_runner "$effective_storage" "$effective_drive_write_mode"
+  build_remote_runner "$effective_storage" "$effective_drive_write_mode" "$remote_port"
   : > "$REMOTE_LOG"
   # Pass --timeout 0 because real `colab exec` defaults to 30s idle timeout!
   colab_cli exec --timeout 0 -s "$SESSION_NAME" -f "$RUNNER_PY" >>"$REMOTE_LOG" 2>&1 &

@@ -25,6 +25,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -43,7 +44,8 @@ if "CONFIG" not in globals():
         "model_spec": {},
         "maya_context": os.environ.get("COLABD_MAYA_CONTEXT", "65536"),
         "maya_drafting": os.environ.get("COLABD_MAYA_DRAFTING", "on"),
-        "maya_port": os.environ.get("COLABD_MAYA_PORT", "8080"),
+        "maya_port": os.environ.get("COLABD_MAYA_PORT", "8081"),
+        "remote_port": os.environ.get("COLABD_REMOTE_PORT", os.environ.get("COLABD_MAYA_PORT", "8081")),
         "strata_kv_format": os.environ.get("COLABD_STRATA_KV_FORMAT", "auto"),
         "strata_parallel": os.environ.get("COLABD_STRATA_PARALLEL", "1"),
         "strata_build_fallback": os.environ.get("COLABD_STRATA_BUILD_FALLBACK", "auto"),
@@ -73,7 +75,8 @@ if ENGINE_TYPE not in ("strata", "maya"):
 
 MAYA_CONTEXT: str = str(CONFIG.get("maya_context", "65536"))
 MAYA_DRAFTING: str = str(CONFIG.get("maya_drafting", "on"))
-MAYA_PORT: int = int(CONFIG.get("maya_port", "8080"))
+MAYA_PORT: int = int(CONFIG.get("maya_port", "8081"))
+REMOTE_PORT: int = int(CONFIG.get("remote_port") or MAYA_PORT)
 STRATA_KV_FORMAT: str = str(CONFIG.get("strata_kv_format", "auto")).strip().lower()
 STRATA_PARALLEL: str = str(CONFIG.get("strata_parallel", "1")).strip()
 STRATA_BUILD_FALLBACK: str = str(CONFIG.get("strata_build_fallback", "auto")).strip().lower()
@@ -1587,11 +1590,48 @@ def prepare_storage_and_deps() -> Tuple[Path, bool]:
     return models_dir, ram_resident
 
 
+def _is_local_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.4):
+            return False
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+
+
+def _select_free_remote_port(preferred_port: int, host: str = "127.0.0.1") -> int:
+    for port in range(preferred_port, min(65536, preferred_port + 128)):
+        if _is_local_port_free(port, host=host):
+            return port
+    return preferred_port
+
+
+def _stop_leftover_strata_if_present() -> None:
+    strata_bin = WORK_DIR / "strata-bin" / "strata"
+    if not strata_bin.is_file():
+        return
+    try:
+        subprocess.run(
+            [str(strata_bin), "launch", "--stop"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 def start_tunnel() -> None:
     if TUNNEL_MODE == "ssh":
         host_disp = "127.0.0.1" if LOCAL_BIND == "0.0.0.0" else LOCAL_BIND
         emit_telemetry(public_url=f"http://{host_disp}:{MAYA_PORT}")
-        log(f"[REMOTE] 隧道模式: Colab 官方 WebSocket SSH -> 本地 http://{host_disp}:{MAYA_PORT}")
+        suffix = f" (远端引擎端口 {REMOTE_PORT})" if REMOTE_PORT != MAYA_PORT else ""
+        log(f"[REMOTE] 隧道模式: Colab 官方 WebSocket SSH -> 本地 http://{host_disp}:{MAYA_PORT}{suffix}")
         return
 
     cf_bin = Path("/usr/local/bin/cloudflared")
@@ -1640,9 +1680,9 @@ def start_tunnel() -> None:
         log(f"[REMOTE] Cloudflare 固定域名隧道已拉起: {pub}")
         return
 
-    log(f"[REMOTE] 正在启动 Cloudflare Quick Tunnel -> http://127.0.0.1:{MAYA_PORT} ...")
+    log(f"[REMOTE] 正在启动 Cloudflare Quick Tunnel -> http://127.0.0.1:{REMOTE_PORT} ...")
     p = subprocess.Popen(
-        [str(cf_bin), "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{MAYA_PORT}"],
+        [str(cf_bin), "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{REMOTE_PORT}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -1667,7 +1707,7 @@ def start_tunnel() -> None:
 
 
 def health_poller(maya_dir: Path, ram_resident: bool) -> None:
-    url = f"http://127.0.0.1:{MAYA_PORT}/health"
+    url = f"http://127.0.0.1:{REMOTE_PORT}/health"
     was_healthy = False
     engine_name = "Strata" if ENGINE_TYPE == "strata" else "Project Maya"
 
@@ -1865,7 +1905,7 @@ def build_strata_launch_cmd(
         "--access",
         "local",
         "--port",
-        str(MAYA_PORT),
+        str(REMOTE_PORT),
         "--api-key",
         MAYA_API_KEY,
         "--yes",
@@ -1913,7 +1953,7 @@ def build_strata_source_setup_cmd(
         "--host",
         "127.0.0.1",
         "--port",
-        str(MAYA_PORT),
+        str(REMOTE_PORT),
         "--api-key",
         MAYA_API_KEY,
     ]
@@ -1997,7 +2037,7 @@ def _tether_strata_background(strata_bin: str, env: Dict[str, str], log_roots: L
             if now - last_probe >= 10.0:
                 last_probe = now
                 req = urllib.request.Request(
-                    f"http://127.0.0.1:{MAYA_PORT}/health",
+                    f"http://127.0.0.1:{REMOTE_PORT}/health",
                     headers={"Authorization": f"Bearer {MAYA_API_KEY}"},
                 )
                 reachable = False
@@ -2156,7 +2196,7 @@ def build_maya_cmd(
         "--host",
         "127.0.0.1",
         "--port",
-        str(MAYA_PORT),
+        str(REMOTE_PORT),
         "--api-key",
         MAYA_API_KEY,
     ]
@@ -2262,7 +2302,7 @@ def run_maya(models_dir: Path, ram_resident: bool) -> int:
             "--host",
             "127.0.0.1",
             "--port",
-            str(MAYA_PORT),
+            str(REMOTE_PORT),
             "--api-key",
             MAYA_API_KEY,
         ]
@@ -2276,7 +2316,18 @@ def run_maya(models_dir: Path, ram_resident: bool) -> int:
 
 
 def main() -> None:
+    global REMOTE_PORT
     models_dir, ram_resident = prepare_storage_and_deps()
+    if ENGINE_TYPE == "strata":
+        _stop_leftover_strata_if_present()
+    if not _is_local_port_free(REMOTE_PORT):
+        if TUNNEL_MODE == "ssh":
+            log(f"[REMOTE][WARN] 远端端口 {REMOTE_PORT} 仍被其他程序占用，若引擎启动报端口冲突请调换 MAYA_PORT（Colab 容器默认占用 8080）。")
+        else:
+            picked = _select_free_remote_port(REMOTE_PORT)
+            if picked != REMOTE_PORT:
+                log(f"[REMOTE][WARN] 远端端口 {REMOTE_PORT} 已被占用，自动切换至空闲端口 {picked}。")
+                REMOTE_PORT = picked
     start_tunnel()
     maya_dir = WORK_DIR / "project-maya"
     threading.Thread(

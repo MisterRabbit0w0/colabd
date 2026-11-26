@@ -31,7 +31,7 @@ Serving open-weight LLMs across Google Colab tiers hits three recurring walls:
 Local Host (Linux / macOS, Bash 3.2+)
   └── colabd (TUI Dashboard + Model Registry + Account-Aware Lifecycle Trap -> `colab stop` on exit)
         ├── Auth Center: Identity-Based OAuth 2.0 Keyring / Isolated ADC / Scope Repair / Safe Logout
-        ├── Tunnel Bridge: Cloudflare HTTPS or `colab ssh --proxy-mode` -> 127.0.0.1:8080
+        ├── Tunnel Bridge: Cloudflare HTTPS or `colab ssh --proxy-mode` -> 127.0.0.1:8081
         └── `colab exec` (keeps Colab Jupyter kernel active)
               │
               ▼

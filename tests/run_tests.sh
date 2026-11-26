@@ -1486,6 +1486,43 @@ assert venv_dir == fake_strata / "terminal" / ".venv"
 assert (venv_dir / "bin" / "python").exists()
 assert subprocess.run([str(venv_dir / "bin" / "python"), "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
+# Verify default MAYA_PORT avoids Colab's port 8080 and dynamic port fallback skips occupied ports
+import socket as _sock
+assert ns["MAYA_PORT"] == 8081
+assert ns["REMOTE_PORT"] == 8081
+with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as occupied:
+    occupied.bind(("127.0.0.1", 0))
+    occupied.listen(1)
+    busy_port = occupied.getsockname()[1]
+    assert ns["_is_local_port_free"](busy_port) is False
+    picked_port = ns["_select_free_remote_port"](busy_port)
+    assert picked_port != busy_port and picked_port > busy_port
+    assert ns["_is_local_port_free"](picked_port) is True
+
+# Verify build_remote_runner supports explicit remote_port override (e.g. MAYA_PORT=8080 -> remote 8081)
+split_port_cmd = f"""
+export TMPDIR="{box}/tmp"
+export XDG_CONFIG_HOME="{box}/cfg"
+export COLABD_RUNTIME_DIR="{box}/rt"
+COLABD_LIB_DIR="{root}/lib"
+source "{root}/lib/core.sh"
+source "{root}/lib/env.sh"
+source "{root}/lib/auth.sh"
+source "{root}/lib/lifecycle.sh"
+load_config
+MODEL_PRESET="strata-inkling-uncensored-sq10"
+MAYA_PORT="8080"
+build_remote_runner "local_nvme" "auto" "8081"
+echo "$RUNNER_PY"
+"""
+split_runner = subprocess.check_output(["bash", "-c", split_port_cmd], text=True).strip().splitlines()[-1]
+ns_sp = {"__name__": "unit_test_split_port"}
+exec(compile(pathlib.Path(split_runner).read_text(), split_runner, "exec"), ns_sp)
+assert ns_sp["MAYA_PORT"] == 8080
+assert ns_sp["REMOTE_PORT"] == 8081
+sp_launch = ns_sp["build_strata_launch_cmd"]("/content/strata-bin/strata", ns_sp["MODEL_SPEC"]["strata"], models_dir / "strata-data", local_strata)
+assert sp_launch[sp_launch.index("--port") + 1] == "8081"
+
 # Build & test expanded Project Maya runner (maya-inkling-2-mini + ablation default on)
 maya_cmd_sh = f"""
 export TMPDIR="{box}/tmp"

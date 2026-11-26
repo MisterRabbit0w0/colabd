@@ -95,7 +95,7 @@ reset_defaults() {
   CF_PUBLIC_HOSTNAME=""
   HF_TOKEN="${HF_TOKEN:-}"
   MAYA_API_KEY="$(generate_api_key)"
-  MAYA_PORT="8080"
+  MAYA_PORT="8081"
   LOCAL_BIND="127.0.0.1"
   NO_VISION="0"
   WEB_UI="1"
