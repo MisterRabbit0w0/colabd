@@ -4,6 +4,7 @@
 # Repository: https://github.com/MisterRabbit0w0/colabd
 # License: MIT
 # ==============================================================================
+# shellcheck source-path=SCRIPTDIR
 
 set -uo pipefail
 
