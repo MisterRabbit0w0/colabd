@@ -24,6 +24,8 @@ COLABD_LIB_DIR="${COLABD_ROOT}/lib"
 
 # shellcheck source=../lib/core.sh
 source "${COLABD_LIB_DIR}/core.sh"
+# shellcheck source=../lib/env.sh
+source "${COLABD_LIB_DIR}/env.sh"
 # shellcheck source=../lib/auth.sh
 source "${COLABD_LIB_DIR}/auth.sh"
 # shellcheck source=../lib/lifecycle.sh
@@ -58,13 +60,16 @@ Usage:
   colabd down                             Stop active runtime(s) on the current account
   colabd down -a|--account <name>         Stop active runtime(s) on a specific saved account
   colabd down --all                       Scan and release active runtimes across ALL saved accounts
+  colabd env [status|setup|upgrade|reset] Manage colabd's isolated uv Python 3.12 + colab CLI runtime
+  colabd doctor                           Alias for 'colabd env status'
   colabd settings                         Open the persistent configuration menu
   colabd version                          Print colabd version
   colabd help                             Show this help message
 
-Configuration & Accounts:
+Configuration & Runtime:
   ${CONFIG_FILE} (mode 0600)
   ${ACCOUNTS_DIR}/<alias>/ (isolated sessions.json & metadata, mode 0700/0600)
+  ${COLABD_VENV_DIR} (managed isolated uv Python ${COLABD_PYTHON_VERSION} venv)
 
 Lifecycle safety:
   Exiting the interactive session, pressing Ctrl+C, switching accounts, logging out,
@@ -244,6 +249,37 @@ handle_down_cli() {
   return 0
 }
 
+handle_env_cli() {
+  local action="${1:-status}"
+  case "$action" in
+    status|info|doctor)
+      print_env_status
+      return $?
+      ;;
+    setup|init|install)
+      ensure_managed_uv_env "install"
+      return $?
+      ;;
+    upgrade|update)
+      ensure_managed_uv_env "upgrade"
+      return $?
+      ;;
+    reset|rebuild)
+      ensure_managed_uv_env "reset"
+      return $?
+      ;;
+    remove|clean)
+      remove_managed_uv_env
+      return $?
+      ;;
+    *)
+      echo "[ERROR] Unknown env subcommand: ${action}" >&2
+      print_help >&2
+      return 1
+      ;;
+  esac
+}
+
 main() {
   load_config
   local sub="${1:-}"
@@ -272,6 +308,17 @@ main() {
       COLABD_SKIP_AUTO_STOP=1
       shift
       handle_auth_cli use "$@"
+      exit $?
+      ;;
+    env)
+      COLABD_SKIP_AUTO_STOP=1
+      shift
+      handle_env_cli "$@"
+      exit $?
+      ;;
+    doctor)
+      COLABD_SKIP_AUTO_STOP=1
+      handle_env_cli status
       exit $?
       ;;
     settings|config)

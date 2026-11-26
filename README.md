@@ -22,6 +22,7 @@ Serving 300B to 750B MoE models on consumer Google Colab hits three concrete wal
 
 - **Zero network I/O during inference.** In `nvme_engram` mode, `colabd` checks your Google Drive cache first, pulls the 161 GB `Engram-Q6_K` shards onto the fast local `/content` NVMe SSD, falls back to Hugging Face download for any missing shard, and symlinks the 114 GB `Mix-128G` weights from Google Drive. At startup, [`project-maya`](https://github.com/mw00/project-maya/blob/main/docs/MEMORY.md) loads all 114 GB of weights into your 272.5 GB VRAM + pinned RAM pool (`--mmap-experts off`). Once ready, experts run 100% from memory and Engram lookups hit local NVMe plus ~140 GB of Linux page cache.
 - **Atomic Drive cache sync.** After the server reaches `/health` HTTP 200, a background worker copies newly downloaded shards back to Google Drive using `.syncing.tmp` temporary files and atomic `os.replace()` renames, governed by your save policy (`both`, `weights_only`, `engram_only`, `none`).
+- **Self-contained isolated `uv` runtime.** `install.sh` and `colabd env setup` automatically provision a dedicated Python 3.12 virtualenv in `~/.local/share/colabd-runtime/venv` containing `google-colab-cli` (and bootstrap a private `uv` binary without modifying your shell profile if `uv` is not installed). Every local helper, `keyring` account operation, `colab` invocation, and SSH `ProxyCommand` runs inside that isolated venv — immune to macOS Python 3.9, Ubuntu 22.04 Python 3.10, PEP 668, `conda`/`pyenv` shims, or missing `PATH` entries.
 - **Tethered lifecycle & multi-account release safety.** `colabd` executes the remote supervisor inside the Colab Jupyter kernel via `colab exec` to satisfy activity-based liveness, binds `SIGINT`, `SIGTERM`, `SIGHUP`, and `EXIT` traps to stop the runtime under its exact owning account, and solves `google-colab-cli`'s lack of a `logout` command via isolated multi-account profiles (OS keyring slots + `0600` ADC snapshots + per-account `sessions.json`). Switching accounts, logging out, or deleting a profile automatically triggers orphan-runtime release guards, and `colabd down --all` sweeps all saved accounts.
 
 ## Architecture
@@ -45,8 +46,7 @@ Google Colab GPU VM (e.g., G4 95.6 GB VRAM + 176.9 GB RAM + 235.7 GB Local NVMe)
 
 ## Requirements
 
-- Linux or macOS with Bash 3.2+ and Python 3.12+.
-- [`google-colab-cli`](https://pypi.org/project/google-colab-cli/) (`colabd` can install or upgrade it directly from menu option `6`).
+- Linux or macOS with Bash 3.2+ (`colabd` automatically bootstraps its own isolated `uv` + Python 3.12 + [`google-colab-cli`](https://pypi.org/project/google-colab-cli/) runtime under `~/.local/share/colabd-runtime/venv`, with zero system Python 3.12 requirement).
 - A Google Colab Pro or Pro+ account for `G4`, `A100`, `H100`, or `L4` GPU runtimes.
 - For [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF): accept the gated repository terms on Hugging Face and generate an `HF_TOKEN`.
 
@@ -113,6 +113,9 @@ colabd settings                # Open persistent configuration editor
 colabd down                    # Stop active runtime(s) on the current account
 colabd down -a <name>          # Stop active runtime(s) on a specific saved account
 colabd down --all              # Sweep and stop active runtimes across ALL saved accounts
+colabd env [status|setup|upgrade|reset]
+                               # Inspect, bootstrap, upgrade, or rebuild the isolated uv venv
+colabd doctor                  # Alias for 'colabd env status'
 colabd version                 # Print colabd version
 ```
 

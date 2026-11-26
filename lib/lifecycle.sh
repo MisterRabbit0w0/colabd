@@ -34,7 +34,7 @@ _collect_sessions_for_account_cb() {
   local_rows="$(account_store sessions-list "$sess_cfg" 2>/dev/null || true)"
 
   local live_out=""
-  if command -v colab >/dev/null 2>&1; then
+  if resolve_colab_bin >/dev/null 2>&1; then
     live_out="$(probe_colab_command "$mode" "$acct" 6 sessions 2>/dev/null || true)"
   fi
 
@@ -43,7 +43,13 @@ _collect_sessions_for_account_cb() {
     managed_name="${ACTIVE_SESSION_NAME:-$SESSION_NAME}"
   fi
 
-  python3 - "$local_rows" "$live_out" "$managed_name" "$out_tracked" "$out_orphans" <<'PY'
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3 2>/dev/null || true)"
+  if [[ -z "$host_py" ]]; then
+    return 1
+  fi
+
+  "$host_py" - "$local_rows" "$live_out" "$managed_name" "$out_tracked" "$out_orphans" <<'PY'
 import pathlib, re, sys
 
 local_rows, live_out, managed_name, out_tracked, out_orphans = sys.argv[1:6]
@@ -102,7 +108,7 @@ _release_sessions_for_account_cb() {
     stop_local_daemons
   fi
 
-  if ! command -v colab >/dev/null 2>&1; then
+  if ! resolve_colab_bin >/dev/null 2>&1; then
     return 0
   fi
 
@@ -347,7 +353,7 @@ stop_colab_instance() {
     stop_local_daemons
   fi
 
-  if ! command -v colab >/dev/null 2>&1; then
+  if ! resolve_colab_bin >/dev/null 2>&1; then
     MANAGED_SESSION=0
     ACTIVE_SESSION_NAME=""
     ACTIVE_SESSION_ACCOUNT=""
@@ -415,8 +421,8 @@ find_other_accounts_with_local_sessions() {
 
 release_all_accounts_runtimes() {
   local interactive_orphans="${1:-0}"
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_RED}[错误] 本机未安装 google-colab-cli。${C_RESET}"
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_RED}[错误] 本机尚未初始化独立 uv 运行环境或未安装 google-colab-cli。${C_RESET}"
     return 1
   fi
 
@@ -513,7 +519,9 @@ cleanup_on_exit() {
 
 build_remote_runner() {
   local effective_storage="$1"
-  python3 - \
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3)"
+  "$host_py" - \
     "$MODEL_PRESET" "$MAYA_CONTEXT" "$MAYA_DRAFTING" "$MAYA_PORT" \
     "$effective_storage" "$DRIVE_PREFETCH" "$DRIVE_SAVE_POLICY" "$EXPERT_RAM_POLICY" \
     "$CUSTOM_MODELS_DIR" "$DRIVE_CACHE_DIR" \
@@ -680,8 +688,8 @@ action_start_or_restart() {
       mkdir -p "${HOME}/.ssh"
       ssh-keygen -t ed25519 -N "" -f "$ssh_key" >/dev/null
     fi
-    local colab_bin
-    colab_bin="$(command -v colab)"
+    local colab_bin=""
+    colab_bin="$(resolve_colab_bin)"
     local proxy_cfg_opt=""
     if [[ -n "$ACTIVE_ACCOUNT" ]]; then
       local sess_cfg

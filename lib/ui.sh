@@ -9,11 +9,14 @@ page_account_auth() {
   while true; do
     clear 2>/dev/null || true
     local cli_ver="未安装"
-    if command -v colab >/dev/null 2>&1; then
-      cli_ver="$(colab version 2>/dev/null | head -n 1 || echo "已安装")"
+    local colab_bin=""
+    colab_bin="$(resolve_colab_bin 2>/dev/null || true)"
+    if [[ -n "$colab_bin" ]]; then
+      cli_ver="$("$colab_bin" version 2>/dev/null | head -n 1 || echo "已安装")"
     fi
 
     echo "${C_BOLD}${C_CYAN}================ Google Colab 多账号切换与 GCP 授权中心 ================${C_RESET}"
+    echo "  运行环境       : $(format_runtime_badge)"
     echo "  Colab CLI 版本 : ${cli_ver}"
     echo "  当前激活槽位   : ${C_BOLD}$(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_EMAIL")${C_RESET}"
     echo "  当前认证模式   : ${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} - $(auth_mode_desc "$COLAB_AUTH_MODE")"
@@ -32,7 +35,7 @@ page_account_auth() {
     echo "  6) 彻底登出当前账号 (先释放活跃实例 -> 清除系统钥匙串 / ADC 凭证)"
     echo "  7) 扫描并一键释放所有已保存账号的残留 Colab 实例 (全局防扣费清理)"
     echo "  8) 远端 Colab 实例 GCP 服务授权 (colab auth) / 切换自动授权开关"
-    echo "  9) 一键安装或升级官方 google-colab-cli"
+    echo "  9) 初始化 / 升级独立 uv 隔离环境 (Python ${COLABD_PYTHON_VERSION} + google-colab-cli)"
     echo "  0) 返回上级菜单"
     echo "${C_CYAN}========================================================================${C_RESET}"
     read -r -p "请选择操作编号 [0-9]: " a_opt
@@ -208,8 +211,10 @@ action_test_request() {
   read -r -p "输入测试提问 [默认: 你好，请用两句话介绍你当前的模型架构]: " prompt_txt
   prompt_txt="${prompt_txt:-你好，请用两句话介绍你当前的模型架构}"
 
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3)"
   local payload
-  payload="$(python3 -c 'import json,sys; print(json.dumps({"messages":[{"role":"user","content":sys.argv[1]}],"stream":True}, ensure_ascii=False))' "$prompt_txt")"
+  payload="$("$host_py" -c 'import json,sys; print(json.dumps({"messages":[{"role":"user","content":sys.argv[1]}],"stream":True}, ensure_ascii=False))' "$prompt_txt")"
 
   echo "${C_CYAN}[请求] POST ${ep}/v1/chat/completions ...${C_RESET}"
   curl -sS --no-buffer "${ep}/v1/chat/completions" \
@@ -483,6 +488,7 @@ run_interactive_loop() {
     echo "${C_BOLD}${C_CYAN}=========================================================================${C_RESET}"
     echo "${C_BOLD}   colabd v${COLABD_VERSION}  |  Frontier LLM Serving Daemon on Google Colab${C_RESET}"
     echo "${C_CYAN}=========================================================================${C_RESET}"
+    echo "  运行环境   : $(format_runtime_badge)"
     echo "  Colab 账号 : $(format_auth_badge)"
     echo "  实例状态   : ${status_badge}"
     echo "  当前模型   : ${C_BOLD}${MODEL_PRESET}${C_RESET}  |  GPU: ${C_BOLD}${GPU_TYPE}${C_RESET}$( [[ "$HIGH_MEM" == "1" ]] && echo " (High-RAM)" )"

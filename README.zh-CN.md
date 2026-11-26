@@ -22,6 +22,7 @@ The endgame for frontier LLM serving on Google Colab.
 
 - **云盘预查找 + 本地 NVMe 跑 Engram + 专家全内存锁页。** 在推荐的 `nvme_engram` 模式下，脚本启动先检索 Google Drive 是否已有缓存分片，把 161 GB `Engram-Q6_K` 顺序拉取到本地高速 `/content` NVMe SSD，缺失分片自动回退走 Hugging Face 公网下载；同时将 114 GB 主权重软链至云盘并在启动时一次性全量锁入显存与系统内存 (`--mmap-experts off`，见 [`project-maya` 内存文档](https://github.com/mw00/project-maya/blob/main/docs/MEMORY.md))。进入服务态后，专家层计算 100% 走内存，Engram 随机查表 100% 走本地 NVMe 与约 140 GB 系统页缓存，推理期零网盘 I/O。
 - **后台原子回存云盘。** 服务通过 `/health` 探测就绪后，后台线程按策略 (`both`、`weights_only`、`engram_only`、`none`) 将本次回退下载的新分片先写为 `.syncing.tmp` 再原子重命名同步回 Google Drive，中断退出绝不留半截脏文件。
+- **独立托管的 `uv` 隔离运行环境。** 安装脚本与 `colabd env setup` 会自动在 `~/.local/share/colabd-runtime/venv` 创建独立的 Python 3.12 虚拟环境并安装 `google-colab-cli`（若本机无 `uv`，自动安装至私有目录且不修改 shell 配置）。`colabd` 所有本地 Python 逻辑、`keyring` 多账号令牌管理、`colab` 命令与 SSH `ProxyCommand` 均统一运行在该隔离环境内，不受系统 Python 版本（如 macOS 3.9 / Ubuntu 22.04 3.10）、PEP 668、`conda`/`pyenv` shim 或 `PATH` 变动影响。
 - **内核保活与多账号系留回收。** 远端守护程序通过 `colab exec` 在 Jupyter 内核内运行以维持官方保活；本机注册 `EXIT`、`INT`、`TERM`、`HUP` 信号钩子，退出面板自动按实例归属账号调用 `colab stop`。针对官方 `google-colab-cli` 未提供 `logout` 子命令的问题，内置多账号槽位管理（OAuth 2.0 系统钥匙串多槽位 + 独立 `adc.json` + 隔离的 `sessions.json`），在切号、真登出或删除槽位前均会先拦截并释放旧账号活跃实例，并支持 `colabd down --all` 一键全局清理所有已保存账号的残留实例。
 
 ## 快速上手
@@ -83,6 +84,9 @@ colabd settings                # 打开本地持久化设置页
 colabd down                    # 立即销毁当前激活账号的活跃实例
 colabd down -a <name>          # 销毁指定已保存账号槽位的活跃实例
 colabd down --all              # 扫描并释放所有已保存账号的残留 Colab 实例
+colabd env [status|setup|upgrade|reset]
+                               # 查看、初始化、升级或重建独立 uv Python 3.12 隔离环境
+colabd doctor                  # 等同于 colabd env status，诊断本地运行环境与依赖
 colabd version                 # 查看版本号
 ```
 

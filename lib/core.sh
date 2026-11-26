@@ -165,6 +165,12 @@ colab_cli_for() {
   local acct="$2"
   shift 2
 
+  local colab_bin=""
+  if ! colab_bin="$(resolve_colab_bin 2>/dev/null)"; then
+    echo "${C_RED}[错误] 未找到 colab 命令，请运行 'colabd env setup' 初始化独立 uv 运行环境。${C_RESET}" >&2
+    return 127
+  fi
+
   local sess_cfg=""
   if [[ -n "$acct" ]]; then
     sess_cfg="$(colab_session_config_path "$acct")"
@@ -181,13 +187,13 @@ colab_cli_for() {
   fi
 
   if [[ -n "$adc_override" && -n "$sess_cfg" ]]; then
-    GOOGLE_APPLICATION_CREDENTIALS="$adc_override" colab --config "$sess_cfg" --auth "$auth_mode" "$@"
+    GOOGLE_APPLICATION_CREDENTIALS="$adc_override" "$colab_bin" --config "$sess_cfg" --auth "$auth_mode" "$@"
   elif [[ -n "$adc_override" ]]; then
-    GOOGLE_APPLICATION_CREDENTIALS="$adc_override" colab --auth "$auth_mode" "$@"
+    GOOGLE_APPLICATION_CREDENTIALS="$adc_override" "$colab_bin" --auth "$auth_mode" "$@"
   elif [[ -n "$sess_cfg" ]]; then
-    colab --config "$sess_cfg" --auth "$auth_mode" "$@"
+    "$colab_bin" --config "$sess_cfg" --auth "$auth_mode" "$@"
   else
-    colab --auth "$auth_mode" "$@"
+    "$colab_bin" --auth "$auth_mode" "$@"
   fi
 }
 
@@ -319,7 +325,10 @@ read_telemetry_field() {
     echo ""
     return
   fi
-  python3 - "$REMOTE_LOG" "$field" <<'PY' 2>/dev/null || true
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3 2>/dev/null || true)"
+  [[ -z "$host_py" ]] && return 0
+  "$host_py" - "$REMOTE_LOG" "$field" <<'PY' 2>/dev/null || true
 import json, sys, pathlib
 log_path = pathlib.Path(sys.argv[1])
 field = sys.argv[2]

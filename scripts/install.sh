@@ -2,12 +2,14 @@
 # ==============================================================================
 # colabd installer
 # Supports both local checkout installation and remote `curl -fsSL ... | bash`
+# Automatically bootstraps colabd's isolated uv Python 3.12 + colab CLI runtime.
 # ==============================================================================
 
 set -euo pipefail
 
 REPO_URL="${COLABD_REPO_URL:-https://github.com/MisterRabbit0w0/colabd.git}"
 INSTALL_HOME="${COLABD_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/colabd}"
+RUNTIME_DIR="${COLABD_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/colabd-runtime}"
 BIN_DIR="${COLABD_BIN_DIR:-$HOME/.local/bin}"
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
@@ -45,6 +47,19 @@ chmod +x "${INSTALL_HOME}/bin/colabd" "${INSTALL_HOME}/scripts/install.sh" "${IN
 ln -sf "${INSTALL_HOME}/bin/colabd" "${BIN_DIR}/colabd"
 
 echo "[colabd] Installed executable to ${BIN_DIR}/colabd"
+
+if [[ "${COLABD_SKIP_VENV_SETUP:-0}" != "1" ]]; then
+  echo "[colabd] Initializing isolated uv Python runtime in ${RUNTIME_DIR}..."
+  if ! COLABD_RUNTIME_DIR="$RUNTIME_DIR" "${BIN_DIR}/colabd" env setup; then
+    if [[ "${COLABD_REQUIRE_VENV:-0}" == "1" ]]; then
+      echo "[ERROR] Failed to initialize isolated uv environment." >&2
+      exit 1
+    fi
+    echo "[WARN] Could not finish isolated uv environment setup right now." >&2
+    echo "       Run 'colabd env setup' later once network access is available." >&2
+  fi
+fi
+
 if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
   echo "[NOTE] Add ${BIN_DIR} to your PATH:"
   echo "       export PATH=\"${BIN_DIR}:\$PATH\""

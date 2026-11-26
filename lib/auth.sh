@@ -4,60 +4,12 @@
 # Compatible with Bash 3.2+ (macOS and Linux)
 # ==============================================================================
 
-resolve_colab_python() {
-  local colab_bin="${1:-}"
-  if [[ -z "$colab_bin" ]]; then
-    colab_bin="$(command -v colab 2>/dev/null || true)"
-  fi
-  [[ -z "$colab_bin" || ! -f "$colab_bin" ]] && return 1
-
-  local first_line=""
-  IFS= read -r first_line < "$colab_bin" 2>/dev/null || true
-  if [[ "$first_line" == "#!"* ]]; then
-    local shebang="${first_line#\#!}"
-    shebang="${shebang#"${shebang%%[![:space:]]*}"}"
-    case "$shebang" in
-      "/usr/bin/env "*)
-        local rest="${shebang#/usr/bin/env }"
-        rest="${rest#-S }"
-        local py_cmd="${rest%% *}"
-        if [[ "$py_cmd" == *python* ]] && command -v "$py_cmd" >/dev/null 2>&1; then
-          command -v "$py_cmd"
-          return 0
-        fi
-        ;;
-      *python*)
-        local py_path="${shebang%% *}"
-        if [[ -x "$py_path" ]]; then
-          echo "$py_path"
-          return 0
-        fi
-        ;;
-    esac
-  fi
-
-  local real_bin="$colab_bin"
-  if command -v python3 >/dev/null 2>&1; then
-    real_bin="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$colab_bin" 2>/dev/null || echo "$colab_bin")"
-  fi
-  local bin_dir
-  bin_dir="$(dirname "$real_bin")"
-  if [[ -x "${bin_dir}/python3" ]]; then
-    echo "${bin_dir}/python3"
-    return 0
-  elif [[ -x "${bin_dir}/python" ]]; then
-    echo "${bin_dir}/python"
-    return 0
-  fi
-
-  return 1
-}
-
 account_store() {
   local py_bin=""
-  py_bin="$(resolve_colab_python 2>/dev/null || true)"
+  py_bin="$(resolve_host_python 2>/dev/null || true)"
   if [[ -z "$py_bin" ]]; then
-    py_bin="python3"
+    echo "${C_RED}[错误] 未找到可用的 Python 解释器，请运行 'colabd env setup' 初始化独立 uv 运行环境。${C_RESET}" >&2
+    return 1
   fi
   COLAB_CLI_CONFIG_DIR="$COLAB_CLI_CONFIG_DIR" "$py_bin" "${COLABD_LIB_DIR}/account_store.py" "$@"
 }
@@ -69,8 +21,14 @@ suggest_alias_from_email() {
     echo "account-1"
     return 0
   fi
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3 2>/dev/null || true)"
+  if [[ -z "$host_py" ]]; then
+    echo "account-1"
+    return 0
+  fi
   local clean
-  clean="$(python3 - "$raw" <<'PY' 2>/dev/null || echo "account-1"
+  clean="$("$host_py" - "$raw" <<'PY' 2>/dev/null || echo "account-1"
 import re, sys
 s = re.sub(r"[^A-Za-z0-9._-]+", "-", sys.argv[1]).strip("._-")
 if not s or not s[0].isalnum():
@@ -87,10 +45,17 @@ probe_colab_command() {
   local timeout_sec="$3"
   shift 3
 
-  local colab_bin
-  colab_bin="$(command -v colab 2>/dev/null || true)"
+  local colab_bin=""
+  colab_bin="$(resolve_colab_bin 2>/dev/null || true)"
   if [[ -z "$colab_bin" ]]; then
     echo "未安装 google-colab-cli"
+    return 1
+  fi
+
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || true)"
+  if [[ -z "$host_py" ]]; then
+    echo "未找到可用的 Python 解释器"
     return 1
   fi
 
@@ -109,7 +74,7 @@ probe_colab_command() {
     adc_override="${ACCOUNTS_DIR}/${acct}/adc.json"
   fi
 
-  python3 - "$colab_bin" "$auth_mode" "$sess_cfg" "$adc_override" "$timeout_sec" "$@" <<'PY'
+  "$host_py" - "$colab_bin" "$auth_mode" "$sess_cfg" "$adc_override" "$timeout_sec" "$@" <<'PY'
 import os
 import signal
 import subprocess
@@ -166,7 +131,10 @@ probe_colab_email_for() {
     return 1
   fi
 
-  python3 - "$out" <<'PY' 2>/dev/null
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3 2>/dev/null || true)"
+  [[ -z "$host_py" ]] && return 1
+  "$host_py" - "$out" <<'PY' 2>/dev/null
 import re, sys
 text = sys.argv[1]
 for line in text.splitlines():
@@ -197,9 +165,9 @@ refresh_colab_auth_status() {
     fi
   fi
 
-  if ! command -v colab >/dev/null 2>&1; then
+  if ! resolve_colab_bin >/dev/null 2>&1; then
     AUTH_STATE="missing_cli"
-    AUTH_DETAIL="未安装 google-colab-cli"
+    AUTH_DETAIL="未初始化独立 uv 运行环境或未安装 google-colab-cli"
     return 1
   fi
 
@@ -404,8 +372,8 @@ resolve_profile_by_index_or_name() {
 
 do_save_current_account() {
   local alias_arg="${1:-}"
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_RED}[错误] 请先安装 google-colab-cli。${C_RESET}"
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_RED}[错误] 请先运行 'colabd env setup' 初始化独立 uv 运行环境。${C_RESET}"
     return 1
   fi
 
@@ -491,8 +459,8 @@ offer_save_unsaved_oauth_before_replace() {
 }
 
 do_oauth2_login() {
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_RED}[错误] 请先安装 google-colab-cli（可在账号页选 [9] 一键安装）。${C_RESET}"
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_RED}[错误] 请先初始化独立 uv 运行环境（可在账号页选 [9] 或执行 colabd env setup）。${C_RESET}"
     return 1
   fi
   if [[ -n "$ACTIVE_ACCOUNT" ]]; then
@@ -543,7 +511,7 @@ do_adc_login() {
       fi
     fi
     save_config
-    if command -v colab >/dev/null 2>&1 && colab_cli sessions; then
+    if resolve_colab_bin >/dev/null 2>&1 && colab_cli sessions; then
       refresh_colab_auth_status 6 1 || true
       echo "${C_GREEN}[成功] GCP ADC 登录并验证 Colab 访问通过！(${AUTH_EMAIL:-凭证有效})${C_RESET}"
       return 0
@@ -559,8 +527,8 @@ do_add_new_account() {
   local mode_arg="${2:-}"
   local auto_release_mode="${3:-prompt}"
 
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_RED}[错误] 请先安装 google-colab-cli（可在账号页选 [9] 一键安装）。${C_RESET}"
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_RED}[错误] 请先初始化独立 uv 运行环境（可在账号页选 [9] 或执行 colabd env setup）。${C_RESET}"
     return 1
   fi
 
@@ -699,8 +667,8 @@ do_switch_account() {
   local target_query="${1:-}"
   local auto_release_mode="${2:-prompt}"
 
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_RED}[错误] 本机未安装 google-colab-cli。${C_RESET}"
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_RED}[错误] 本机尚未初始化独立 uv 运行环境或未安装 google-colab-cli。${C_RESET}"
     return 1
   fi
 
@@ -779,8 +747,8 @@ do_colab_logout() {
   local auto_release_mode="${1:-prompt}"
   local interactive_post="${2:-1}"
 
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_RED}[错误] 本机未安装 google-colab-cli。${C_RESET}"
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_RED}[错误] 本机尚未初始化独立 uv 运行环境或未安装 google-colab-cli。${C_RESET}"
     return 1
   fi
 
@@ -898,8 +866,8 @@ do_delete_account() {
 }
 
 do_remote_gcp_auth() {
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_RED}[错误] 本机未安装 google-colab-cli。${C_RESET}"
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_RED}[错误] 本机尚未初始化独立 uv 运行环境或未安装 google-colab-cli。${C_RESET}"
     return 1
   fi
   local target="${ACTIVE_SESSION_NAME:-$SESSION_NAME}"
@@ -924,35 +892,28 @@ do_remote_gcp_auth() {
 
 do_install_or_update_cli() {
   echo ""
-  if command -v colab >/dev/null 2>&1; then
-    echo "${C_CYAN}[升级] 正在检查并更新 google-colab-cli ...${C_RESET}"
-    colab update --install || {
-      if command -v uv >/dev/null 2>&1; then
-        uv tool upgrade google-colab-cli
-      else
-        python3 -m pip install --upgrade google-colab-cli
-      fi
-    }
+  local src=""
+  src="$(colab_runtime_source)"
+  if [[ "$src" == "managed_venv" ]]; then
+    ensure_managed_uv_env "upgrade" || return 1
   else
-    echo "${C_CYAN}[安装] 正在安装官方 google-colab-cli ...${C_RESET}"
-    if command -v uv >/dev/null 2>&1; then
-      uv tool install google-colab-cli
-    else
-      python3 -m pip install --user google-colab-cli
+    if [[ "$src" == "external" ]]; then
+      echo "${C_YELLOW}[迁移] 当前使用的是外部 colab CLI，正在初始化 colabd 专属独立 uv 隔离环境 (${COLABD_VENV_DIR})...${C_RESET}"
     fi
+    ensure_managed_uv_env "install" || return 1
   fi
   refresh_colab_auth_status 5 0 || true
 }
 
 ensure_cli_and_authenticated() {
-  if ! command -v colab >/dev/null 2>&1; then
-    echo "${C_YELLOW}[未安装 CLI] 本机未检测到 'colab' 命令 (google-colab-cli)。${C_RESET}"
-    read -r -p "是否立即自动安装 google-colab-cli? [Y/n]: " inst_yn
+  if ! resolve_colab_bin >/dev/null 2>&1; then
+    echo "${C_YELLOW}[未初始化环境] 本机未检测到 colabd 独立 uv 运行环境或外部 'colab' 命令。${C_RESET}"
+    read -r -p "是否立即自动创建独立 uv (Python ${COLABD_PYTHON_VERSION}) 虚拟环境并安装 google-colab-cli? [Y/n]: " inst_yn
     if [[ "${inst_yn:-Y}" =~ ^[Nn]$ ]]; then
       return 1
     fi
-    do_install_or_update_cli
-    command -v colab >/dev/null 2>&1 || return 1
+    do_install_or_update_cli || return 1
+    resolve_colab_bin >/dev/null 2>&1 || return 1
   fi
 
   if ! refresh_colab_auth_status 5 0; then

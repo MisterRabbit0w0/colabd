@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Self-contained isolated `uv` Python 3.12 runtime (`~/.local/share/colabd-runtime/venv`) managed via `install.sh` and `colabd env [status|setup|upgrade|reset]` / `colabd doctor`, eliminating system Python version, PEP 668, `PATH`, and `conda`/`pyenv` shim breakage.
 - Modular CLI daemon (`bin/colabd` and `lib/*`) compatible with Linux and macOS Bash 3.2+.
 - Interactive terminal control panel with status dashboard, live build and inference log viewer, settings editor, and streaming API test runner.
 - Non-blocking Google Colab login probe (`colab sessions` & `colab whoami`), full multi-account profile switching (OS keyring OAuth 2.0 slots + isolated `0600` ADC credentials + per-account `sessions.json`), real logout clearing OS keyring/ADC tokens, account-aware orphan-runtime release guards (`colabd down -a <name>` / `colabd down --all`), and remote VM GCP credential propagation via `colab auth`.

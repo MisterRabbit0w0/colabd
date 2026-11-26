@@ -2,10 +2,11 @@
 
 ## Architecture
 
-`colabd` splits host control from remote execution across six files:
+`colabd` splits host control from remote execution across seven files:
 
-- `bin/colabd` resolves symlinks, parses subcommands (including multi-account `auth`/`switch`/`down`), registers signal traps, and loads modules.
+- `bin/colabd` resolves symlinks, parses subcommands (including multi-account `auth`/`switch`/`down` and runtime `env`/`doctor`), registers signal traps, and loads modules.
 - `lib/core.sh` manages atomic `0600` config files in `~/.config/colabd/config.env`, per-account `colab` CLI wrappers, and model metadata.
+- `lib/env.sh` manages `colabd`'s isolated `uv` Python 3.12 runtime (`~/.local/share/colabd-runtime/venv`), standalone `uv` bootstrap, unified `colab`/`python` binary resolution, and environment diagnostics (`colabd doctor`).
 - `lib/account_store.py` manages OS keyring OAuth 2.0 profile slots, `0600` ADC credential snapshots, isolated per-account `sessions.json` files, real credential clearing (logout), and optional orphan runtime unassignment.
 - `lib/auth.sh` probes [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) login state and email (`colab whoami`), manages multi-account add/save/switch/delete/logout flows, and forwards GCP credentials with `colab auth`.
 - `lib/lifecycle.sh` allocates Colab GPU runtimes, tracks runtime account ownership, enforces pre-switch/pre-logout/pre-delete release guards, sweeps all saved accounts (`colabd down --all`), checks `/content` disk space, mounts Google Drive, manages local OpenSSH `ProxyCommand` port forwarding, and runs account-aware `colab stop` on exit.
