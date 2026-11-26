@@ -346,20 +346,20 @@ select_preset_from_tier() {
 configure_custom_model_interactive() {
   echo ""
   echo "${C_BOLD}${C_CYAN}--- 自定义 Hugging Face 仓库 / 量化模型 ---${C_RESET}"
-  echo "  1) Strata 引擎自定义 HF 模型 (.strata / .gguf / Safetensors，或 Strata 官方目录量化)"
-  echo "  2) Project Maya 引擎自定义模型 ID / HF 仓库 (--model / --ds4-quant / --model-dir)"
+  echo "  1) Strata 引擎自定义 HF 模型 (.strata / .gguf / Safetensors，或官方目录量化)"
+  echo "  2) Project Maya 引擎自定义模型参数 / HF 仓库"
   echo "  0) 返回"
   read -r -p "选择引擎 [1-2，回车取消]: " c_eng
   case "${c_eng:-0}" in
     1)
       echo ""
-      echo "选择 Strata 模型家族:"
-      echo "  1) inkling-2-mini  (Inkling 2 Mini .strata / GGUF，推荐 Free T4)"
-      echo "  2) qwen            (Qwen3.8-Flash-Next ISTA-DASLab / GGUF)"
-      echo "  3) qwen36          (Qwen3.6-35B-A3B)"
-      echo "  4) hy4-flash       (Tencent Hy4-Flash)"
-      echo "  5) unsloth         (Qwen3.8-Flash-Next Unsloth)"
-      echo "  6) gyro            (Qwen3.8-Flash-Next Gyro)"
+      echo "选择 Strata 模型家族 (或输入自定义家族名):"
+      echo "  1) inkling-2-mini"
+      echo "  2) qwen"
+      echo "  3) qwen36"
+      echo "  4) hy4-flash"
+      echo "  5) unsloth"
+      echo "  6) gyro"
       read -r -p "选择家族 [1-6，回车保持 ${CUSTOM_ENGINE_FAMILY:-inkling-2-mini}]: " f_idx
       case "$f_idx" in
         1) CUSTOM_ENGINE_FAMILY="inkling-2-mini" ;;
@@ -370,9 +370,8 @@ configure_custom_model_interactive() {
         6) CUSTOM_ENGINE_FAMILY="gyro" ;;
       esac
       echo ""
-      echo "示例 HF 仓库: SC117/Inkling-2-Mini-abliterated-Strata 或 AtomicChat/Inkling-2-Mini-Uncensored-GGUF"
-      echo "(若留空 HF 仓库，则直接按 Strata 官方目录 --family + --model 量化名拉取)"
-      read -r -p "Hugging Face 仓库 (org/repo，输入 CLEAR 清空) [当前: ${CUSTOM_HF_REPO}]: " in_repo
+      echo "填写 Hugging Face 仓库 (<org>/<repo>，留空则直接按 Strata 官方目录 --family + --model 拉取):"
+      read -r -p "Hugging Face 仓库 (输入 CLEAR 清空) [当前: ${CUSTOM_HF_REPO}]: " in_repo
       if [[ "$in_repo" == "CLEAR" ]]; then
         CUSTOM_HF_REPO=""
       elif [[ -n "$in_repo" ]]; then
@@ -391,10 +390,7 @@ configure_custom_model_interactive() {
       ;;
     2)
       echo ""
-      echo "Project Maya 模型参数示例:"
-      echo "  • 直接模型 ID: GLM-5.3-UD-IQ2_M / EXL3-4.05bpw / hy4-flash-q4_k_m / minimax-maya-s"
-      echo "  • DeepSeek 量化简写: ds4:gguf-iq3_s / ds4:exl3-2.25 / ds4:gguf-iq1_m"
-      echo "  • Hy4 量化简写: hy4:maya-s / hy4:q4_k_m"
+      echo "输入 Project Maya 上游模型参数 (模型 ID 或 <family>:<quant> 简写；留空则配合下方自定义 HF 仓库使用):"
       read -r -p "Maya 模型参数 (输入 CLEAR 清空) [当前: ${CUSTOM_ENGINE_FAMILY}]: " in_marg
       if [[ "$in_marg" == "CLEAR" ]]; then
         CUSTOM_ENGINE_FAMILY=""
@@ -426,10 +422,10 @@ configure_custom_model_interactive() {
 select_model_preset_interactive() {
   echo ""
   echo "${C_BOLD}${C_CYAN}请选择模型硬件分组 (当前引擎: $(resolve_effective_engine "$MODEL_PRESET") | 当前预设: ${MODEL_PRESET}):${C_RESET}"
-  echo "  1) Free / 入门卡推荐 (T4 16GB, Std-RAM) — Strata + Inkling-2-Mini Uncensored (SQ-10/15/GGUF) & Maya Inkling"
-  echo "  2) 中端卡推荐 (L4 24GB / High-RAM)      — Strata SQ-20 / Qwen3.6 / Qwen3.8 Coder·Q2 & Maya GLM-S24 / Hy4-XS"
-  echo "  3) 旗舰卡推荐 (A100 / G4 / H100)        — Maya DeepSeek-V4.1 / GLM-5.3 744B / MiniMax-M3.1 / Hy4 & Strata 旗舰"
-  echo "  4) 自定义 Hugging Face 仓库 / 量化模型   — 任意 Strata .strata/.gguf 或 Project Maya 自定义模型"
+  echo "  1) Free / 入门卡推荐 (T4 16GB, Std-RAM)"
+  echo "  2) 中端卡推荐 (L4 24GB / High-RAM)"
+  echo "  3) 旗舰卡推荐 (A100 / G4 / H100)"
+  echo "  4) 自定义 Hugging Face 仓库 / 量化模型"
   echo "  5) 直接输入预设 ID"
   echo "  0) 返回"
   read -r -p "选择分组 [0-5]: " t_opt
@@ -439,7 +435,7 @@ select_model_preset_interactive() {
     3) select_preset_from_tier "flagship" "旗舰卡推荐 (A100 80GB / G4 96GB / H100 80GB)" || true ;;
     4) configure_custom_model_interactive ;;
     5)
-      read -r -p "输入预设 ID (如 strata-inkling-uncensored-sq10): " raw_id
+      read -r -p "输入预设 ID (可先运行 'colabd models' 查看全部 ID): " raw_id
       if [[ -n "$raw_id" ]]; then
         local resolved=""
         if resolved="$(model_registry exists "$raw_id" 2>/dev/null)"; then
@@ -463,7 +459,7 @@ configure_engine_tuning_interactive() {
   echo "${C_BOLD}${C_CYAN}--- 引擎专属参数调优 (当前生效引擎: $(engine_label "$eff_eng")) ---${C_RESET}"
   echo "  [Strata 参数]"
   echo "    1) Strata KV 缓存格式     : ${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} (auto | int8 | fp8 | fp16 | q4_0)"
-  echo "    2) Strata 并发槽数        : ${C_GREEN}${STRATA_PARALLEL}${C_RESET} (1..64, Inkling 支持多并发)"
+  echo "    2) Strata 并发槽数        : ${C_GREEN}${STRATA_PARALLEL}${C_RESET} (1..64，取决于模型与显存容量)"
   echo "    3) Strata 预编译/源码策略 : ${C_GREEN}${STRATA_BUILD_FALLBACK}${C_RESET} — $(strata_fallback_desc "$STRATA_BUILD_FALLBACK")"
   echo "  [Project Maya 参数]"
   echo "    4) MoE 专家全内存常驻策略 : ${C_GREEN}${EXPERT_RAM_POLICY}${C_RESET} — $(ram_policy_desc "$EXPERT_RAM_POLICY")"
@@ -512,7 +508,7 @@ configure_engine_tuning_interactive() {
     4)
       echo "可选 MoE 专家全内存常驻策略:"
       echo "  1) auto       : 智能判断 (当显存+内存充足如 G4 272GB 时自动设置 --mmap-experts off 全载入内存)"
-      echo "  2) force_ram  : 强制锁死全内存 (注入 DS4_REQUIRE_ALL_RAM=1 / MAYA_GLM_RAM_RESIDENT=1，严禁落盘)"
+      echo "  2) force_ram  : 强制锁死全内存 (启用全内存常驻环境变量与 --mmap-experts off，严禁落盘)"
       echo "  3) allow_disk : 允许保留文件映射按需读盘 (--mmap-experts on，适合小内存环境)"
       read -r -p "选择编号 [1-3]: " rp_idx
       case "$rp_idx" in
@@ -606,9 +602,9 @@ page_settings() {
       3)
         echo ""
         echo "可选运行期存储拓扑 (均支持配合第 4 项的云盘预查找与回存):"
-        echo "  1) auto         : 智能匹配 (小模型/无外挂表走本地盘，DeepSeek 在 235GB 盘走反向跨盘 nvme_engram)"
-        echo "  2) nvme_engram  : 反向跨盘推荐 — Engram 拉取到本地高速 NVMe 跑 + 主权重挂云盘全进内存 (推理零网盘 I/O)"
-        echo "  3) drive_engram : 正向跨盘 — 主权重放本地 NVMe + 161GB Engram 软链在云盘上按需查表"
+        echo "  1) auto         : 智能匹配 (本地盘足够走 local_nvme，超大外挂表模型走反向跨盘 nvme_engram)"
+        echo "  2) nvme_engram  : 反向跨盘推荐 — 外挂查表拉取到本地高速 NVMe 跑 + 主权重挂云盘全进内存 (推理零网盘 I/O)"
+        echo "  3) drive_engram : 正向跨盘 — 主权重放本地 NVMe + 外挂查表软链在云盘上按需读取"
         echo "  4) drive_full   : 全量云盘直连 — 所有权重与表均直接在 Google Drive 目录读写"
         echo "  5) local_nvme   : 纯本地高速盘 — 所有文件在本地盘运行 (Free T4 / 轻模型推荐，仍可配合云盘拉取/回存)"
         read -r -p "选择编号 [1-5]: " s_idx
@@ -627,9 +623,9 @@ page_settings() {
         if [[ "${pf:-Y}" =~ ^[Nn]$ ]]; then DRIVE_PREFETCH="0"; else DRIVE_PREFETCH="1"; fi
         echo ""
         echo "当云盘缺失分片并触发公网回退下载后，是否将新分片持久化回存云盘?"
-        echo "  1) both         : 主权重与 Engram 均同步回存云盘 (下次全免公网下载)"
-        echo "  2) weights_only : 仅将主权重存云盘，161GB Engram 仅在本地临时盘用 (适合 200GB 云盘)"
-        echo "  3) engram_only  : 仅将 161GB Engram 回存云盘"
+        echo "  1) both         : 主权重与外挂查表均同步回存云盘 (下次全免公网下载)"
+        echo "  2) weights_only : 仅将主权重存云盘，外挂查表仅在本地临时使用"
+        echo "  3) engram_only  : 仅将外挂查表分片回存云盘"
         echo "  4) none         : 不向云盘写入任何新下载分片 (云盘仅作只读缓存源或完全不写，Free 号推荐)"
         read -r -p "选择回存策略 [1-4，回车保持 ${DRIVE_SAVE_POLICY}]: " sp_idx
         case "$sp_idx" in
@@ -680,7 +676,7 @@ page_settings() {
         ;;
       9)
         echo ""
-        echo "提示: 下载 orcarouter 去审查版需先在 Hugging Face 网页同意受限仓库条款。"
+        echo "提示: 下载受限或私有 Hugging Face 仓库前，需先在网页同意条款并配置 Token。"
         read -r -s -p "输入 Hugging Face Token (hf_...，留空保持不变，输入 CLEAR 清空): " hft
         echo ""
         if [[ "$hft" == "CLEAR" ]]; then

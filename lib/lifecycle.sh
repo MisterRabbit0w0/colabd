@@ -1072,12 +1072,12 @@ action_start_or_restart() {
       effective_storage="local_nvme"
     elif model_has_engram "$MODEL_PRESET" && [[ "$free_gb" -ge 175 ]]; then
       echo ""
-      echo "${C_YELLOW}[空间检测] 本地 /content 剩余约 ${free_gb} GiB (小于完整 ${total_needed} GiB，但足以放 161GB Engram 表)。${C_RESET}"
+      echo "${C_YELLOW}[空间检测] 本地 /content 剩余约 ${free_gb} GiB (小于完整 ${total_needed} GiB，但足以存放外挂查表)。${C_RESET}"
       echo "请选择本次跨盘与缓存运行方案:"
-      echo "  1) 【反向跨盘 nvme_engram】(推荐: 先去云盘找 Engram 拉到本地 NVMe 跑，主权重挂云盘全载入内存，推理零网盘 I/O)"
-      echo "  2) 【正向跨盘 drive_engram】(主权重放本地 NVMe，161GB Engram 软链在云盘上按需查表)"
+      echo "  1) 【反向跨盘 nvme_engram】(推荐: 先去云盘找外挂表拉到本地 NVMe 跑，主权重挂云盘全载入内存，推理零网盘 I/O)"
+      echo "  2) 【正向跨盘 drive_engram】(主权重放本地 NVMe，外挂查表软链在云盘上按需读取)"
       echo "  3) 【全量云盘 drive_full】  (所有文件均在 ${DRIVE_CACHE_DIR} 上读写)"
-      echo "  4) 改跑无需外挂表的【GLM-5.3-Flash Maya-M-Derisked 去拒绝版】(约 116GB，本地盘直跑)"
+      echo "  4) 改跑无需外挂表的本地直跑预设 (自动切至 local_nvme)"
       echo "  0) 取消启动并立即回收实例"
       read -r -p "请输入选项 [1]: " disk_choice
       disk_choice="${disk_choice:-1}"

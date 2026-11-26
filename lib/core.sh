@@ -70,12 +70,12 @@ reset_defaults() {
   GPU_TYPE="G4"                                # G4 (RTX PRO 6000 96GB) | H100 | A100 | L4 | T4
   HIGH_MEM="1"                                 # 1: pass --high-mem, 0: standard RAM (required for Free T4)
   ENGINE_TYPE="auto"                           # auto | strata | maya
-  MODEL_PRESET="ds4-abliterated-128g"          # Default uncensored Mix-128G (or switch to Free T4 Strata Inkling)
-  CUSTOM_HF_REPO=""                            # Custom HF repo for strata-custom-hf / maya-custom
-  CUSTOM_HF_FILE=""                            # Custom HF filename (.strata / .gguf) or Strata catalog model tag
-  CUSTOM_ENGINE_FAMILY="inkling-2-mini"        # Strata family or Maya custom --model/--ds4-quant spec
+  MODEL_PRESET="ds4-abliterated-128g"          # Default preset ID (switch via 'colabd use' or Settings)
+  CUSTOM_HF_REPO=""                            # Custom HF repo for custom presets
+  CUSTOM_HF_FILE=""                            # Custom HF filename (.strata / .gguf) or catalog model tag
+  CUSTOM_ENGINE_FAMILY="inkling-2-mini"        # Engine model family or custom model argument
   MAYA_CONTEXT="65536"                         # 32768 | 65536 | 131072 | 262144
-  MAYA_DRAFTING="on"                           # on | off | measure (Strata: auto/dspark/off)
+  MAYA_DRAFTING="on"                           # on | off | measure
   STRATA_KV_FORMAT="auto"                      # auto | int8 | fp8 | fp16 | q4_0
   STRATA_PARALLEL="1"                          # 1..64 concurrent slots
   STRATA_BUILD_FALLBACK="auto"                 # auto | prebuilt | source
@@ -406,20 +406,20 @@ maya_ablation_desc() {
 
 storage_desc() {
   case "$1" in
-    auto)         echo "自动匹配 (235GB 盘跑 DeepSeek 自动选反向跨盘: 本地 NVMe 放 Engram)" ;;
-    nvme_engram)  echo "反向跨盘推荐 (Engram 拉取到本地 NVMe + 主权重云盘软链全进内存，推理零网盘 I/O)" ;;
-    drive_engram) echo "正向跨盘 (主权重放本地 NVMe + 161GB Engram 软链在云盘运行)" ;;
+    auto)         echo "自动匹配 (本地盘足够走 local_nvme，超大外挂表模型自动选反向跨盘 nvme_engram)" ;;
+    nvme_engram)  echo "反向跨盘推荐 (外挂查表拉取到本地 NVMe + 主权重云盘软链全进内存，推理零网盘 I/O)" ;;
+    drive_engram) echo "正向跨盘 (主权重放本地 NVMe + 外挂查表软链在云盘运行)" ;;
     drive_full)   echo "全量云盘直连 (所有文件直接挂载于 ${DRIVE_CACHE_DIR})" ;;
-    local_nvme)   echo "纯本地/自定义高速盘 (${CUSTOM_MODELS_DIR}，仍可配合云盘拉取/回存)" ;;
+    local_nvme)   echo "纯本地高速盘 (${CUSTOM_MODELS_DIR}，仍可配合云盘拉取/回存)" ;;
     *)            echo "$1" ;;
   esac
 }
 
 save_policy_desc() {
   case "$1" in
-    both)         echo "主权重与 Engram 新下载分片均回存云盘" ;;
-    weights_only) echo "仅主权重存云盘 (161GB Engram 仅在本地临时使用)" ;;
-    engram_only)  echo "仅 161GB Engram 回存云盘" ;;
+    both)         echo "主权重与外挂查表新下载分片均回存云盘" ;;
+    weights_only) echo "仅主权重存云盘 (外挂查表仅在本地临时使用)" ;;
+    engram_only)  echo "仅外挂查表分片回存云盘" ;;
     none)         echo "不向云盘写入任何新分片 (仅只读查找或纯本地)" ;;
     *)            echo "$1" ;;
   esac
@@ -428,7 +428,7 @@ save_policy_desc() {
 ram_policy_desc() {
   case "$1" in
     auto)       echo "智能常驻 (内存池充足时自动 --mmap-experts off 全载入 RAM)" ;;
-    force_ram)  echo "强制全内存锁死 (开启 DS4_REQUIRE_ALL_RAM=1 / --mmap-experts off)" ;;
+    force_ram)  echo "强制全内存锁死 (启用全内存常驻环境变量与 --mmap-experts off)" ;;
     allow_disk) echo "允许文件映射交换 (--mmap-experts on，省系统内存)" ;;
     *)          echo "$1" ;;
   esac

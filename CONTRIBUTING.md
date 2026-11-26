@@ -2,15 +2,16 @@
 
 ## Architecture
 
-`colabd` splits host control from remote execution across seven files:
+`colabd` splits host control from remote execution across eight files:
 
-- `bin/colabd` resolves symlinks, parses subcommands (including multi-account `auth`/`switch`/`down` and runtime `env`/`doctor`), registers signal traps, and loads modules.
-- `lib/core.sh` manages atomic `0600` config files in `~/.config/colabd/config.env`, per-account `colab` CLI wrappers, and model metadata.
+- `bin/colabd` resolves symlinks, parses subcommands (including `models`/`use`/`up`, multi-account `auth`/`switch`/`down`, and runtime `env`/`doctor`), registers signal traps, and loads modules.
+- `lib/model_registry.py` provides the single source of truth for inference engine definitions, hardware-tiered presets, and custom Hugging Face model resolution.
+- `lib/core.sh` manages atomic `0600` config files in `~/.config/colabd/config.env`, per-account `colab` CLI wrappers, and registry metadata lookups.
 - `lib/env.sh` manages `colabd`'s isolated `uv` Python 3.12 runtime (`~/.local/share/colabd-runtime/venv`), standalone `uv` bootstrap, unified `colab`/`python` binary resolution, and environment diagnostics (`colabd doctor`).
 - `lib/account_store.py` manages identity-based accounts keyed uniquely by normalized `(email, auth_mode)`, OS keyring OAuth 2.0 entries, `0600` ADC credential snapshots, isolated per-account `sessions.json` files, `colab whoami` scope validation, opt-in token revocation / keyring purging, and optional orphan runtime unassignment.
 - `lib/auth.sh` probes [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) login state, email, and granted scopes (`colab whoami`), manages deduplicated login, in-place scope repair (`auth refresh`), switching, safe removal/logout, and remote VM GCP credential forwarding via `colab auth`.
-- `lib/lifecycle.sh` allocates Colab GPU runtimes, tracks runtime account ownership, enforces pre-switch guards and Fail-Closed pre-delete release verification gates, sweeps all saved accounts (`colabd down --all`), verifies `/content` disk space and Google Drive mount readiness, manages local OpenSSH `ProxyCommand` port forwarding, and runs account-aware `colab stop` on exit.
-- `lib/remote_supervisor.py` runs inside the remote Colab Jupyter kernel via `colab exec`. Keeping the kernel active maintains Colab liveness. The supervisor prefetches cached shards from Google Drive onto local NVMe, configures symlinks, starts `cloudflared`, launches [`mw00/project-maya`](https://github.com/mw00/project-maya), polls `/health`, and syncs newly downloaded shards back to Google Drive using atomic `.syncing.tmp` renames.
+- `lib/lifecycle.sh` allocates Colab GPU runtimes (with Free-tier `--high-mem` fallback), tracks runtime account ownership, enforces pre-switch guards and Fail-Closed pre-delete release verification gates, sweeps all saved accounts (`colabd down --all`), verifies `/content` disk space and Google Drive mount readiness, manages local OpenSSH `ProxyCommand` port forwarding, and runs account-aware `colab stop` on exit.
+- `lib/remote_supervisor.py` runs inside the remote Colab Jupyter kernel via `colab exec`. Keeping the kernel active maintains Colab liveness. The supervisor probes GPU/driver/memory metrics, prefetches cached shards from Google Drive onto local NVMe, downloads missing Hugging Face files, starts `cloudflared`, dispatches the selected inference engine ([`Niko1221/Strata`](https://github.com/Niko1221/Strata) or [`mw00/project-maya`](https://github.com/mw00/project-maya)), polls `/health` for readiness, and syncs newly downloaded shards back to Google Drive using atomic `.syncing.tmp` renames.
 
 ## Host shell portability rules
 

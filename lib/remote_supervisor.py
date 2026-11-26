@@ -8,7 +8,7 @@ Responsibilities:
 1. Inspect remote GPU VRAM, NVIDIA driver version, system RAM, local NVMe free space, and Drive mount.
 2. Prefetch cached model/Engram shards from Google Drive onto local NVMe when enabled.
 3. Configure storage & symlink topology (`nvme_engram`, `drive_engram`, `drive_full`, `local_nvme`).
-4. Fetch custom/abliterated Hugging Face `.strata`/`.gguf`/safetensors files with resumable atomic downloads.
+4. Fetch custom Hugging Face `.strata`/`.gguf`/safetensors files with resumable atomic downloads.
 5. Start reverse tunnels (Cloudflare Quick/Named Tunnel or SSH local port forward).
 6. Launch the selected inference engine:
    - `strata`: Prebuilt CUDA fast path when NVIDIA driver >= 575.51 (with automatic source-build fallback
