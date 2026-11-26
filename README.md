@@ -21,7 +21,7 @@ Serving open-weight LLMs across Google Colab tiers hits three recurring walls:
 `colabd` solves all three problems from a single terminal binary on Linux and macOS:
 
 - **Multi-engine dispatch with hardware-aware defaults.** Supports both **Strata** (prebuilt CUDA fast-path with automatic source-build fallback on older drivers) and **Project Maya** (three-tier VRAM/RAM/NVMe MoE engine with optional refusal-direction ablation), plus custom Hugging Face `.strata`, `.gguf`, and safetensors repositories. Switching presets automatically aligns recommended GPU, `--high-mem` (off on Free `T4`), context length, and storage layout.
-- **Hybrid NVMe / Drive cache pipeline.** Prefetches cached weights and lookup tables from Google Drive onto local `/content` NVMe SSD, falls back to resumable Hugging Face downloads for missing shards, keeps experts resident in VRAM + pinned RAM (`--mmap-experts off`) when memory permits, and atomically syncs newly downloaded shards back to Google Drive using `.syncing.tmp` renames after `/health` reports ready.
+- **Direct-to-target storage & high-speed HF downloads.** Models that fit on local `/content` NVMe run purely locally without mounting Google Drive, using multi-threaded HTTP Range downloads and `HF_HUB_ENABLE_HF_TRANSFER=1` / `HF_XET_HIGH_PERFORMANCE=1`. Oversized models expand directly onto Google Drive with zero post-download sync-back: Drive-bound weights stream straight to Drive via **Google Drive REST API v3 Resumable Upload** (zero local write cache, HTTP 200 verified) when `colab auth` credentials are available, or fall back to sequential FUSE direct-write guarded by local root disk watermark backpressure and pre-exit flush protection, while experts stay resident in VRAM + pinned RAM (`--mmap-experts off`).
 - **Self-contained isolated `uv` runtime.** `install.sh` and `colabd env setup` automatically provision a dedicated Python 3.12 virtualenv in `~/.local/share/colabd-runtime/venv` containing `google-colab-cli` (and bootstrap a private `uv` binary without modifying your shell profile if `uv` is not installed). Every local helper, `keyring` account operation, `colab` invocation, and SSH `ProxyCommand` runs inside that isolated venv — immune to macOS Python 3.9, Ubuntu 22.04 Python 3.10, PEP 668, `conda`/`pyenv` shims, or missing `PATH` entries.
 - **Tethered lifecycle, identity-based accounts & scope repair.** `colabd` executes the remote supervisor inside the Colab Jupyter kernel via `colab exec` for activity-based liveness, binds `SIGINT`/`SIGTERM`/`SIGHUP`/`EXIT` traps to stop runtimes under their exact owning account, and manages accounts keyed uniquely by normalized `(email, auth_mode)` (automatic deduplication, OS keyring OAuth 2.0 storage, `0600` ADC snapshots, and per-account `sessions.json`). Login and `colabd auth refresh` inspect granted `Scopes` via `colab whoami` to catch and repair missing permissions (such as `colaboratory` or `drive.file`), while `auth remove` / `auth logout` enforce a hard release gate that refuses to delete credentials if stopping active runtimes fails.
 
@@ -38,10 +38,10 @@ Local Host (Linux / macOS, Bash 3.2+)
 Google Colab GPU VM (Free T4 / L4 / A100 / G4 / H100)
   └── remote_supervisor.py
         ├── 1. Probe GPU, VRAM, NVIDIA driver version, system RAM, and disk space
-        ├── 2. Prefetch cached shards from Google Drive -> Local NVMe & download missing HF files
+        ├── 2. Direct-to-target placement: multi-threaded Range HF -> local NVMe, or Drive API streaming / FUSE direct -> Drive
         ├── 3. Dispatch engine adapter (Strata prebuilt/source or Project Maya)
         ├── 4. Serve authenticated OpenAI (`/v1/chat/completions`, `/v1/responses`) & Anthropic (`/v1/messages`)
-        └── 5. Verify `/health` readiness & atomically sync new shards back (`.syncing.tmp` -> Google Drive)
+        └── 5. Poll `/health` readiness & guard FUSE DriveFS cache / flush on exit
 ```
 
 ## Supported engines & hardware tiers
@@ -53,7 +53,7 @@ Run `colabd models` to inspect the full built-in preset catalog grouped by hardw
 | **Free / Entry (`T4 16GB`, Std-RAM)** | `strata`, `maya` | Prebuilt CUDA fast-path (with automatic source-build fallback on older drivers), standard-RAM allocation with automatic `--high-mem` fallback, and local NVMe serving without requiring Google Drive. |
 | **Mid-Range (`L4 24GB` / High-RAM)** | `strata`, `maya` | Higher-precision quantizations, vision input, speculative drafting, and concurrent request slots. |
 | **Flagship (`A100` / `G4` / `H100`)** | `maya`, `strata` | Large-scale MoE serving with three-tier VRAM/RAM/NVMe memory management and hybrid Drive routing. |
-| **Custom HF Repo / Quant** | `strata`, `maya` | Bring your own Hugging Face `.strata`, `.gguf`, safetensors repo, or upstream engine quant argument with full Drive prefetch and atomic sync-back. |
+| **Custom HF Repo / Quant** | `strata`, `maya` | Bring your own Hugging Face `.strata`, `.gguf`, safetensors repo, or upstream engine quant argument with multi-threaded NVMe downloads and direct-to-Drive expansion. |
 
 ## Requirements
 
@@ -94,24 +94,23 @@ Or launch `colabd` with no arguments for the interactive TUI:
 4. Point Claude Code, VS Code, Cursor, or any OpenAI/Anthropic SDK at the printed URL and Bearer API key.
 5. Press `0` or `Ctrl+C` when finished. `colabd` terminates the tunnel and runs `colab stop` to release your runtime.
 
-## Storage topologies and Google Drive policies
+## Storage topologies and direct-to-Drive expansion
 
-Configure both the runtime layout (`STORAGE_MODE`) and post-download write-back policy (`DRIVE_SAVE_POLICY`) in menu option `5`:
+Configure both the runtime layout (`STORAGE_MODE`) and download/Drive write transport (`HF_DOWNLOAD_CONCURRENCY` / `DRIVE_WRITE_MODE`) in menu option `5`:
 
 | Storage mode | Runtime placement | Best match |
 | :--- | :--- | :--- |
-| `auto` | Automatically picks `local_nvme` when the model fits local disk, or hybrid cross-disk modes when external tables exceed local NVMe | Recommended default across Free and Pro+ runtimes |
-| `local_nvme` | All weights run on local `/content` NVMe (still supports optional Drive prefetch and sync-back) | Models that fit within local VM disk capacity |
-| `nvme_engram` | External lookup tables pulled to local `/content` NVMe; main weights symlinked from Drive and loaded into VRAM + pinned RAM | Large external-table models whose combined size exceeds local NVMe |
-| `drive_engram` | Main weights on local NVMe; external lookup tables symlinked directly on Google Drive | Skipping lookup-table copy wait when slower cold lookups are acceptable |
-| `drive_full` | All weights and tables read and written directly on `/content/drive/MyDrive` | Very large models whose weights alone exceed local VM disk capacity |
+| `auto` | Picks `local_nvme` (zero Drive mount) when the model fits local disk, or `nvme_engram` / `drive_full` when capacity expansion is needed | Recommended default across Free and Pro+ runtimes |
+| `local_nvme` | All files download directly to local `/content` NVMe via multi-threaded HTTP Range (never mounts Google Drive) | Models that fit within local VM disk capacity |
+| `nvme_engram` | External lookup tables download directly to local `/content` NVMe; main weights download directly to Google Drive and load into VRAM + pinned RAM | Large external-table models whose combined size exceeds local NVMe |
+| `drive_engram` | Main weights download directly to local NVMe; external lookup tables live directly on Google Drive | Skipping lookup-table local storage when slower cold lookups are acceptable |
+| `drive_full` | All weights and tables download and run directly on `/content/drive/MyDrive` | Very large models whose weights exceed local VM disk capacity |
 
-| Drive save policy | Behavior after fallback download |
+| Drive write mode (`DRIVE_WRITE_MODE`) | Direct-to-Drive transport behavior (used only during Drive expansion) |
 | :--- | :--- |
-| `both` | Atomically backs up both main weights and external lookup tables to Google Drive |
-| `weights_only` | Persists main weights on Drive; keeps external lookup tables ephemeral on local NVMe |
-| `engram_only` | Persists external lookup tables on Drive only |
-| `none` | Never writes new shards to Drive (Drive acts as read-only cache or stays unmounted) |
+| `auto` | Uses **Google Drive REST API v3 Resumable Streaming** (0 local cache, HTTP 200 verified) whenever remote `colab auth` credentials are present; automatically falls back to FUSE direct-write with local disk watermark backpressure |
+| `api_stream` | Enforces Google Drive REST API v3 streaming upload (automatically triggers `colab auth` on expansion start) |
+| `fuse` | Uses sequential `/content/drive` FUSE direct-write with local root disk watermark backpressure and pre-exit flush protection (no `colab auth` needed) |
 
 ## CLI subcommands
 

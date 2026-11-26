@@ -6,19 +6,19 @@ Supports multiple inference engines (`strata` and `maya`) and tiered/custom Hugg
 
 Responsibilities:
 1. Inspect remote GPU VRAM, NVIDIA driver version, system RAM, local NVMe free space, and Drive mount.
-2. Prefetch cached model/Engram shards from Google Drive onto local NVMe when enabled.
-3. Configure storage & symlink topology (`nvme_engram`, `drive_engram`, `drive_full`, `local_nvme`).
-4. Fetch custom Hugging Face `.strata`/`.gguf`/safetensors files with resumable atomic downloads.
+2. Configure direct-to-target storage & symlink topology (`local_nvme`, `nvme_engram`, `drive_engram`, `drive_full`)
+   with zero post-download sync-back or Drive->NVMe copying.
+3. Download local NVMe Hugging Face files via multi-threaded HTTP Range workers (resumable + atomic rename).
+4. Stream Drive-bound expansion weights directly to Google Drive via:
+   - Google Drive REST API v3 Resumable Upload (zero local disk cache, HTTP 200 verified) when a Drive API token
+     is available, or
+   - Sequential FUSE direct-write with local root disk watermark backpressure & pre-exit flush protection.
 5. Start reverse tunnels (Cloudflare Quick/Named Tunnel or SSH local port forward).
-6. Launch the selected inference engine:
-   - `strata`: Prebuilt CUDA fast path when NVIDIA driver >= 575.51 (with automatic source-build fallback
-     on older Colab drivers), foreground log tether, and clean `strata launch --stop` shutdown.
-   - `maya`: Full Project Maya model catalog, RAM expert residency (`--mmap-experts off`), and refusal
-     ablation (`--ablation` / `--ablate-default`).
-7. Poll `/health` (verifying `loaded == true` for Strata JSON responses) and atomically sync newly
-   downloaded shards back to Google Drive.
+6. Launch the selected inference engine (`strata` or `maya`) with high-speed HF download env flags enabled.
+7. Poll `/health` (verifying `loaded == true` for Strata JSON responses) and stream telemetry on the main thread.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import queue
@@ -50,8 +50,8 @@ if "CONFIG" not in globals():
         "maya_ablation": os.environ.get("COLABD_MAYA_ABLATION", "on"),
         "maya_ablate_default": os.environ.get("COLABD_MAYA_ABLATE_DEFAULT", "off"),
         "storage_mode": os.environ.get("COLABD_STORAGE_MODE", "nvme_engram"),
-        "drive_prefetch": os.environ.get("COLABD_DRIVE_PREFETCH", "1"),
-        "drive_save_policy": os.environ.get("COLABD_DRIVE_SAVE_POLICY", "both"),
+        "hf_download_concurrency": os.environ.get("COLABD_HF_DOWNLOAD_CONCURRENCY", "8"),
+        "drive_write_mode": os.environ.get("COLABD_DRIVE_WRITE_MODE", "auto"),
         "expert_ram_policy": os.environ.get("COLABD_EXPERT_RAM_POLICY", "auto"),
         "custom_models_dir": os.environ.get("COLABD_CUSTOM_MODELS_DIR", "/content/maya-models"),
         "drive_cache_dir": os.environ.get("COLABD_DRIVE_CACHE_DIR", "/content/drive/MyDrive/maya-models"),
@@ -81,8 +81,13 @@ MAYA_ABLATION: str = str(CONFIG.get("maya_ablation", "on")).strip().lower()
 MAYA_ABLATE_DEFAULT: str = str(CONFIG.get("maya_ablate_default", "off")).strip().lower()
 
 STORAGE_MODE: str = str(CONFIG.get("storage_mode", "nvme_engram"))
-DRIVE_PREFETCH: bool = str(CONFIG.get("drive_prefetch", "1")) == "1"
-DRIVE_SAVE_POLICY: str = str(CONFIG.get("drive_save_policy", "both"))
+try:
+    HF_DOWNLOAD_CONCURRENCY: int = max(1, min(16, int(str(CONFIG.get("hf_download_concurrency", "8")).strip() or "8")))
+except ValueError:
+    HF_DOWNLOAD_CONCURRENCY = 8
+DRIVE_WRITE_MODE: str = str(CONFIG.get("drive_write_mode", "auto")).strip().lower()
+if DRIVE_WRITE_MODE not in ("auto", "api_stream", "fuse"):
+    DRIVE_WRITE_MODE = "auto"
 EXPERT_RAM_POLICY: str = str(CONFIG.get("expert_ram_policy", "auto"))
 CUSTOM_MODELS_DIR: str = str(CONFIG.get("custom_models_dir", "/content/maya-models"))
 DRIVE_CACHE_DIR: str = str(CONFIG.get("drive_cache_dir", "/content/drive/MyDrive/maya-models"))
@@ -97,6 +102,18 @@ LOCAL_BIND: str = str(CONFIG.get("local_bind", "127.0.0.1"))
 
 WORK_DIR = Path(os.environ.get("MAYA_WORK_ROOT", "/content"))
 DRIVE_MOUNT_ROOT = Path(os.environ.get("MAYA_DRIVE_MOUNT_ROOT", "/content/drive/MyDrive"))
+DRIVEFS_CACHE_ROOT = Path(os.environ.get("COLABD_DRIVEFS_CACHE_DIR", "/root/.config/Google/DriveFS"))
+
+HF_BASE_URL = os.environ.get("COLABD_HF_BASE_URL", "https://huggingface.co").rstrip("/")
+DRIVE_API_BASE = os.environ.get("COLABD_DRIVE_API_BASE", "https://www.googleapis.com/drive/v3").rstrip("/")
+DRIVE_UPLOAD_BASE = os.environ.get("COLABD_DRIVE_UPLOAD_BASE", "https://www.googleapis.com/upload/drive/v3").rstrip("/")
+
+MULTIPART_MIN_BYTES = max(1024 * 1024, int(os.environ.get("COLABD_MULTIPART_MIN_BYTES", str(64 * 1024 * 1024))))
+_raw_drive_chunk = int(os.environ.get("COLABD_DRIVE_CHUNK_BYTES", str(16 * 1024 * 1024)))
+DRIVE_API_CHUNK_BYTES = max(256 * 1024, (_raw_drive_chunk // (256 * 1024)) * (256 * 1024))
+FUSE_MIN_LOCAL_FREE_GB = float(os.environ.get("COLABD_FUSE_MIN_LOCAL_FREE_GB", "20.0"))
+FUSE_CRITICAL_LOCAL_FREE_GB = float(os.environ.get("COLABD_FUSE_CRITICAL_LOCAL_FREE_GB", "5.0"))
+FUSE_BACKPRESSURE_MAX_WAIT_SEC = float(os.environ.get("COLABD_FUSE_MAX_WAIT_SEC", "600.0"))
 
 STRATA_PREBUILT_DRIVER_FLOOR = (575, 51)
 STRATA_INSTALL_URL = os.environ.get(
@@ -139,7 +156,7 @@ if isinstance(MODEL_SPEC.get("cache_subdir"), str) and MODEL_SPEC["cache_subdir"
     MODEL_SUBDIRS[MODEL_PRESET] = MODEL_SPEC["cache_subdir"]
 
 SHARD_SUFFIXES = {".gguf", ".strata", ".safetensors", ".bin", ".json", ".txt", ".jinja", ".model"}
-TEMP_SUFFIXES = (".tmp", ".part", ".pulling.tmp", ".syncing.tmp")
+TEMP_SUFFIXES = (".tmp", ".part", ".part.meta.json", ".pulling.tmp", ".syncing.tmp")
 SKIP_SYNC_DIRS = {
     "slots",
     "maya-ds4",
@@ -156,12 +173,14 @@ SKIP_SYNC_DIRS = {
 
 procs: List[subprocess.Popen] = []
 telemetry_lock = threading.Lock()
-output_queue = queue.Queue()
+output_queue: "queue.Queue[Optional[str]]" = queue.Queue()
 _main_thread_id = threading.get_ident()
 _main_loop_active = False
 _stop_event = threading.Event()
 _active_strata_bin: Optional[str] = None
 _active_strata_env: Optional[Dict[str, str]] = None
+_wrote_via_fuse = False
+_drive_folder_cache: Dict[Tuple[str, ...], str] = {}
 
 TELEMETRY: Dict[str, Any] = {
     "phase": "初始化远端环境",
@@ -173,10 +192,11 @@ TELEMETRY: Dict[str, Any] = {
     "ram_gb": 0.0,
     "local_free_gb": 0.0,
     "drive_free_gb": None,
+    "drivefs_cache_gb": 0.0,
     "models_dir": "",
     "ram_resident_active": False,
-    "cache_sync_state": "idle",
-    "cache_sync_detail": "无待回存任务",
+    "drive_io_state": "disabled",
+    "drive_io_detail": "纯本地模式 (未挂载云盘)",
     "public_url": "",
     "api_healthy": False,
 }
@@ -247,15 +267,60 @@ def check_health_response(status_code: int, body_bytes: bytes) -> Tuple[bool, st
     return True, "ready"
 
 
+def _measure_drivefs_cache_gb() -> float:
+    if not DRIVEFS_CACHE_ROOT.exists():
+        return 0.0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(DRIVEFS_CACHE_ROOT, followlinks=False):
+        for fn in filenames:
+            try:
+                total += (Path(dirpath) / fn).stat().st_size
+            except OSError:
+                pass
+    return round(total / (1024 ** 3), 2)
+
+
+def _is_on_drive_mount(path: Path) -> bool:
+    if not DRIVE_MOUNT_ROOT.exists():
+        return False
+    try:
+        drive_real = os.path.realpath(str(DRIVE_MOUNT_ROOT))
+        # Resolve parent if file itself does not exist yet so symlinks on parent dirs are honored!
+        probe_target = path if path.exists() else path.parent
+        target_real = os.path.realpath(str(probe_target))
+        return target_real == drive_real or target_real.startswith(drive_real + os.sep)
+    except OSError:
+        return False
+
+
+def _drive_rel_parts(dst: Path) -> Optional[List[str]]:
+    if not _is_on_drive_mount(dst):
+        return None
+    drive_real = Path(os.path.realpath(str(DRIVE_MOUNT_ROOT)))
+    parent_real = Path(os.path.realpath(str(dst.parent)))
+    full_real = parent_real / dst.name
+    try:
+        rel = full_real.relative_to(drive_real)
+    except ValueError:
+        return None
+    return [p for p in rel.parts if p and p != "."]
+
+
 def refresh_disk_metrics() -> None:
     target_local = WORK_DIR if WORK_DIR.exists() else Path("/")
     local_free = shutil.disk_usage(target_local).free / (1024 ** 3)
+    drive_mounted = DRIVE_MOUNT_ROOT.exists()
     drive_free = (
         round(shutil.disk_usage(DRIVE_MOUNT_ROOT).free / (1024 ** 3), 1)
-        if DRIVE_MOUNT_ROOT.exists()
+        if drive_mounted
         else None
     )
-    emit_telemetry(local_free_gb=round(local_free, 1), drive_free_gb=drive_free)
+    dfs_gb = _measure_drivefs_cache_gb() if drive_mounted else 0.0
+    emit_telemetry(
+        local_free_gb=round(local_free, 1),
+        drive_free_gb=drive_free,
+        drivefs_cache_gb=dfs_gb,
+    )
 
 
 def cleanup_temp_files(root: Path) -> None:
@@ -268,6 +333,27 @@ def cleanup_temp_files(root: Path) -> None:
                     (Path(dirpath) / fn).unlink()
                 except OSError:
                     pass
+
+
+def flush_drivefs_before_exit() -> None:
+    """Best-effort flush of pending FUSE DriveFS writes before VM teardown."""
+    if not _wrote_via_fuse or not DRIVE_MOUNT_ROOT.exists():
+        return
+    if os.environ.get("COLABD_SKIP_DRIVE_FLUSH") == "1":
+        return
+    emit_telemetry(drive_io_state="flushing", drive_io_detail="退出前正在刷新 DriveFS 写缓存至 Google Drive...")
+    log("[DRIVE] 检测到本次曾通过 FUSE 写入 Google Drive，正在执行退出前刷盘 (os.sync + drive.flush_and_unmount)...")
+    try:
+        os.sync()
+    except OSError:
+        pass
+    try:
+        from google.colab import drive as _colab_drive  # type: ignore
+
+        _colab_drive.flush_and_unmount()
+        log("[DRIVE] DriveFS 缓存刷新并卸载完成。")
+    except Exception as exc:
+        log(f"[DRIVE][WARN] 无法调用 google.colab.drive.flush_and_unmount() ({exc})，已执行 os.sync()。")
 
 
 def terminate_all(*_args: Any) -> None:
@@ -307,8 +393,10 @@ def terminate_all(*_args: Any) -> None:
                     p.kill()
                 except Exception:
                     pass
+    cleanup_temp_files(Path(CUSTOM_MODELS_DIR))
     if DRIVE_MOUNT_ROOT.exists():
         cleanup_temp_files(Path(DRIVE_CACHE_DIR))
+        flush_drivefs_before_exit()
     sys.exit(0)
 
 
@@ -356,142 +444,6 @@ def list_valid_shards(folder: Path) -> List[Tuple[Path, Path, int]]:
                 except OSError:
                     pass
     return found
-
-
-def copy_file_stream(src: Path, dst: Path, tmp_suffix: str, progress_prefix: str) -> bool:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src_size = src.stat().st_size
-    if dst.exists() and not dst.is_symlink() and dst.stat().st_size == src_size:
-        return False
-
-    free_bytes = shutil.disk_usage(dst.parent).free
-    if free_bytes < src_size + (2 * 1024 ** 3):
-        log(
-            f"[CACHE][SKIP] 目标盘 ({dst.parent}) 剩余空间不足 ({free_bytes / (1024**3):.1f} GiB)，"
-            f"跳过拷贝 {src.name} ({src_size / (1024**3):.1f} GiB)"
-        )
-        return False
-
-    tmp_dst = dst.with_name(dst.name + tmp_suffix)
-    copied = 0
-    last_report = time.time()
-    start_t = last_report
-    buf_size = 16 * 1024 * 1024
-
-    try:
-        with src.open("rb") as fsrc, tmp_dst.open("wb") as fdst:
-            while True:
-                chunk = fsrc.read(buf_size)
-                if not chunk:
-                    break
-                fdst.write(chunk)
-                copied += len(chunk)
-                now = time.time()
-                if now - last_report >= 4.0:
-                    pct = (copied / src_size) * 100.0
-                    mb_s = (copied / (1024 ** 2)) / max(now - start_t, 0.1)
-                    log(
-                        f"[CACHE] {progress_prefix}: {src.name} {pct:.1f}% "
-                        f"({copied/(1024**3):.1f}/{src_size/(1024**3):.1f} GiB, {mb_s:.0f} MB/s)"
-                    )
-                    last_report = now
-        if tmp_dst.stat().st_size != src_size:
-            raise IOError("拷贝完成后字节数不一致")
-        os.replace(tmp_dst, dst)
-        return True
-    except Exception as exc:
-        log(f"[CACHE][WARN] 拷贝 {src.name} 中断 ({exc})，将交由下游回退处理。")
-        try:
-            tmp_dst.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
-
-
-def prefetch_dir_from_drive(drive_candidates: List[Path], local_target: Path, label: str) -> int:
-    pulled_count = 0
-    for cand in drive_candidates:
-        shards = list_valid_shards(cand)
-        if not shards:
-            continue
-        total_gb = sum(sz for _, _, sz in shards) / (1024 ** 3)
-        log(f"[CACHE] 在云盘 ({cand}) 发现 {len(shards)} 个 {label} 分片 (共 {total_gb:.1f} GiB)，开始拉取至本地 NVMe...")
-        emit_telemetry(phase=f"从云盘拉取 {label} 至本地 NVMe")
-        for rel, src_fp, _sz in shards:
-            dst_fp = local_target / rel
-            if copy_file_stream(src_fp, dst_fp, ".pulling.tmp", f"拉取 {label}"):
-                pulled_count += 1
-            refresh_disk_metrics()
-        break
-    if pulled_count == 0 and not list_valid_shards(local_target):
-        log(f"[CACHE] 云盘未找到可复用的 {label} 分片，稍后自动回退公网高速下载。")
-    return pulled_count
-
-
-def sync_new_shards_to_drive(local_models_dir: Path) -> None:
-    if DRIVE_SAVE_POLICY == "none":
-        emit_telemetry(cache_sync_state="disabled", cache_sync_detail="已按设置关闭回存云盘")
-        return
-    if STORAGE_MODE == "drive_full":
-        emit_telemetry(cache_sync_state="done", cache_sync_detail="全量云盘直连模式 (实时落盘)")
-        return
-    if not DRIVE_MOUNT_ROOT.exists():
-        emit_telemetry(cache_sync_state="skipped", cache_sync_detail="未挂载 Google Drive，跳过回存")
-        return
-
-    drive_root = Path(DRIVE_CACHE_DIR)
-    drive_root.mkdir(parents=True, exist_ok=True)
-
-    tasks: List[Tuple[str, Path, Path, int]] = []
-    engram_local = local_models_dir / "Engram-Q6_K"
-    if DRIVE_SAVE_POLICY in ("both", "engram_only") and engram_local.exists() and not engram_local.is_symlink():
-        for rel, src_fp, sz in list_valid_shards(engram_local):
-            dst_fp = drive_root / "Engram-Q6_K" / rel
-            if not dst_fp.exists() or dst_fp.stat().st_size != sz:
-                tasks.append(("Engram", src_fp, dst_fp, sz))
-
-    if DRIVE_SAVE_POLICY in ("both", "weights_only"):
-        for item in sorted(local_models_dir.iterdir()):
-            if item.name == "Engram-Q6_K" or item.name in SKIP_SYNC_DIRS or item.is_symlink():
-                continue
-            if item.is_dir():
-                for rel, src_fp, sz in list_valid_shards(item):
-                    if any(part in SKIP_SYNC_DIRS for part in rel.parts):
-                        continue
-                    dst_fp = drive_root / item.name / rel
-                    if not dst_fp.exists() or dst_fp.stat().st_size != sz:
-                        tasks.append(("主权重", src_fp, dst_fp, sz))
-
-    if not tasks:
-        emit_telemetry(cache_sync_state="done", cache_sync_detail="云盘分片已是最新，无需回存")
-        log("[CACHE] 云盘缓存检查完毕：所有目标分片均已同步。")
-        return
-
-    total_bytes = sum(t[3] for t in tasks)
-    log(
-        f"[CACHE] 后台启动回存任务：共 {len(tasks)} 个新下载分片 "
-        f"({total_bytes/(1024**3):.1f} GiB) 将原子同步至云盘 ({drive_root})..."
-    )
-    emit_telemetry(
-        cache_sync_state="syncing",
-        cache_sync_detail=f"正在回存 {len(tasks)} 个分片 ({total_bytes/(1024**3):.1f} GiB)",
-    )
-
-    synced = 0
-    for idx, (kind, src_fp, dst_fp, _sz) in enumerate(tasks, 1):
-        emit_telemetry(
-            cache_sync_state="syncing",
-            cache_sync_detail=f"[{idx}/{len(tasks)}] 正在回存{kind}: {src_fp.name}",
-        )
-        if copy_file_stream(src_fp, dst_fp, ".syncing.tmp", f"回存{kind}[{idx}/{len(tasks)}]"):
-            synced += 1
-        refresh_disk_metrics()
-
-    emit_telemetry(
-        cache_sync_state="done",
-        cache_sync_detail=f"已完成回存 ({synced}/{len(tasks)} 个新分片写入云盘)",
-    )
-    log(f"[CACHE] 云盘后台回存全部结束：成功写入 {synced}/{len(tasks)} 个分片。")
 
 
 def decide_ram_residency(vram_gb: float, ram_gb: float) -> bool:
@@ -543,6 +495,16 @@ def patch_existing_maya_configs(maya_dir: Path, ram_resident: bool) -> None:
             pass
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent urllib from treating HTTP 308 Resume Incomplete as a redirect."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def _hf_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     headers = {"User-Agent": "colabd/0.2"}
     if HF_TOKEN:
@@ -552,15 +514,48 @@ def _hf_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return headers
 
 
-def download_hf_file(repo: str, filename: str, dst: Path, optional: bool = False) -> Optional[Path]:
-    """Download a file from Hugging Face with Range resume and atomic rename."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists() and not dst.is_symlink() and dst.stat().st_size > 0:
-        log(f"[HF] 命中本地缓存文件，跳过下载: {dst.name} ({dst.stat().st_size / (1024**3):.2f} GiB)")
-        return dst
-
+def _hf_resolve_url(repo: str, filename: str) -> str:
     encoded_path = "/".join(urllib.parse.quote(part, safe="") for part in filename.split("/"))
-    url = f"https://huggingface.co/{repo}/resolve/main/{encoded_path}"
+    return f"{HF_BASE_URL}/{repo}/resolve/main/{encoded_path}"
+
+
+def _probe_hf_file(url: str, optional: bool = False) -> Tuple[Optional[int], bool, str, bool]:
+    """Probe HF URL via `GET Range: bytes=0-0`.
+
+    Returns `(total_bytes, supports_range, final_url, skipped_optional)`.
+    """
+    req = urllib.request.Request(url, headers=_hf_headers({"Range": "bytes=0-0"}))
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            status = getattr(resp, "status", 200)
+            final_url = resp.geturl() or url
+            cr = resp.headers.get("Content-Range", "")
+            cl = resp.headers.get("Content-Length", "")
+            # Drain the 1-byte probe body so connection closes cleanly
+            resp.read(16)
+            if status == 206 and "/" in cr:
+                total_str = cr.rsplit("/", 1)[-1].strip()
+                if total_str.isdigit():
+                    return int(total_str), True, final_url, False
+            if cl.isdigit():
+                supports_r = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
+                return int(cl), supports_r, final_url, False
+            return None, False, final_url, False
+    except urllib.error.HTTPError as exc:
+        if optional and exc.code in (404, 403):
+            return None, False, url, True
+        if exc.code == 416:
+            return 0, False, url, False
+        raise RuntimeError(f"探测 {url} 失败 (HTTP {exc.code})") from exc
+    except Exception:
+        if optional:
+            return None, False, url, True
+        raise
+
+
+def _download_hf_local_single(url: str, dst: Path, optional: bool = False) -> Optional[Path]:
+    """Single-stream resumable download to local NVMe with atomic rename."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
     part_path = dst.with_name(dst.name + ".part")
     existing = part_path.stat().st_size if part_path.is_file() else 0
 
@@ -573,12 +568,12 @@ def download_hf_file(repo: str, filename: str, dst: Path, optional: bool = False
             os.replace(part_path, dst)
             return dst
         if optional and exc.code in (404, 403):
-            log(f"[HF][INFO] 可选伴随文件 {repo}/{filename} 不存在 (HTTP {exc.code})，跳过。")
+            log(f"[HF][INFO] 可选伴随文件不存在 (HTTP {exc.code})，跳过: {dst.name}")
             return None
-        raise RuntimeError(f"下载 {repo}/{filename} 失败 (HTTP {exc.code})") from exc
+        raise RuntimeError(f"下载 {dst.name} 失败 (HTTP {exc.code})") from exc
     except Exception as exc:
         if optional:
-            log(f"[HF][WARN] 下载可选文件 {filename} 失败 ({exc})，继续。")
+            log(f"[HF][WARN] 下载可选文件 {dst.name} 失败 ({exc})，继续。")
             return None
         raise
 
@@ -592,9 +587,9 @@ def download_hf_file(repo: str, filename: str, dst: Path, optional: bool = False
         mode = "ab" if existing > 0 and status == 206 else "wb"
 
         if total:
-            log(f"[HF] 开始下载 {repo}/{filename} ({total / (1024**3):.2f} GiB)...")
+            log(f"[HF] 开始下载 {dst.name} ({total / (1024**3):.2f} GiB, 单流)...")
         else:
-            log(f"[HF] 开始下载 {repo}/{filename} ...")
+            log(f"[HF] 开始下载 {dst.name} ...")
         emit_telemetry(phase=f"下载 {dst.name}")
 
         written = existing
@@ -631,8 +626,694 @@ def download_hf_file(repo: str, filename: str, dst: Path, optional: bool = False
         return dst
 
 
+def _download_hf_local_multipart(url: str, dst: Path, total: int, workers: int) -> Path:
+    """Multi-threaded HTTP Range download directly onto local NVMe with resumable chunk metadata."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part_path = dst.with_name(dst.name + ".part")
+    meta_path = dst.with_name(dst.name + ".part.meta.json")
+
+    if total >= 128 * 1024 * 1024:
+        chunk_size = 16 * 1024 * 1024
+    else:
+        chunk_size = max(256 * 1024, (total + (workers * 2) - 1) // (workers * 2))
+
+    chunks: List[Tuple[int, int, int]] = []
+    idx = 0
+    pos = 0
+    while pos < total:
+        end = min(total - 1, pos + chunk_size - 1)
+        chunks.append((idx, pos, end))
+        pos = end + 1
+        idx += 1
+
+    done_indices = set()
+    resuming = False
+    if part_path.is_file() and meta_path.is_file() and part_path.stat().st_size == total:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("total") == total and meta.get("chunk_size") == chunk_size:
+                done_indices = {int(i) for i in meta.get("done", []) if 0 <= int(i) < len(chunks)}
+                resuming = len(done_indices) > 0
+        except Exception:
+            done_indices = set()
+
+    if not resuming:
+        with part_path.open("wb") as fh:
+            fh.truncate(total)
+        meta_path.write_text(
+            json.dumps({"total": total, "chunk_size": chunk_size, "done": []}),
+            encoding="utf-8",
+        )
+
+    pending = [c for c in chunks if c[0] not in done_indices]
+    already_bytes = sum((c[2] - c[1] + 1) for c in chunks if c[0] in done_indices)
+
+    log(
+        f"[HF] 开始并发下载 {dst.name} ({total / (1024**3):.2f} GiB, "
+        f"{workers} 线程, {len(pending)}/{len(chunks)} 待拉分块)..."
+    )
+    emit_telemetry(phase=f"并发下载 {dst.name} ({workers}x)")
+
+    state_lock = threading.Lock()
+    progress = {"bytes": already_bytes, "new_bytes": 0, "last_report": time.time(), "start_t": time.time()}
+    fd = os.open(str(part_path), os.O_RDWR)
+
+    def fetch_chunk(c_idx: int, start: int, end: int) -> None:
+        expected = end - start + 1
+        last_exc: Optional[BaseException] = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(url, headers=_hf_headers({"Range": f"bytes={start}-{end}"}))
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    status = getattr(resp, "status", 200)
+                    if status != 206:
+                        raise IOError(f"分块 Range 请求返回非 206 状态码 ({status})")
+                    data = resp.read()
+                if len(data) != expected:
+                    raise IOError(f"分块字节数不匹配 ({len(data)} != {expected})")
+                # POSIX atomic positioned write (thread-safe without shared file offset)
+                written_chunk = 0
+                mv = memoryview(data)
+                while written_chunk < expected:
+                    n = os.pwrite(fd, mv[written_chunk:], start + written_chunk)
+                    if n <= 0:
+                        raise IOError("os.pwrite 写入 0 字节")
+                    written_chunk += n
+                with state_lock:
+                    done_indices.add(c_idx)
+                    progress["bytes"] += expected
+                    progress["new_bytes"] += expected
+                    now = time.time()
+                    if now - progress["last_report"] >= 4.0 or len(done_indices) == len(chunks):
+                        pct = min(100.0, (progress["bytes"] / total) * 100.0)
+                        mb_s = (progress["new_bytes"] / (1024 ** 2)) / max(now - progress["start_t"], 0.1)
+                        log(
+                            f"[HF] {dst.name} ({workers}x): {pct:.1f}% "
+                            f"({progress['bytes']/(1024**3):.2f}/{total/(1024**3):.2f} GiB, {mb_s:.1f} MB/s)"
+                        )
+                        try:
+                            meta_path.write_text(
+                                json.dumps({"total": total, "chunk_size": chunk_size, "done": sorted(done_indices)}),
+                                encoding="utf-8",
+                            )
+                        except OSError:
+                            pass
+                        refresh_disk_metrics()
+                        progress["last_report"] = now
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 3:
+                    time.sleep(min(8.0, 1.5 * (2 ** attempt)))
+        raise RuntimeError(f"分块 {c_idx} ({start}-{end}) 下载失败: {last_exc}") from last_exc
+
+    try:
+        if pending:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(fetch_chunk, ci, st, ed) for ci, st, ed in pending]
+                for fut in as_completed(futs):
+                    fut.result()
+    finally:
+        os.close(fd)
+
+    if len(done_indices) != len(chunks) or part_path.stat().st_size != total:
+        raise IOError(f"{dst.name} 并发下载校验不完整")
+    try:
+        meta_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    os.replace(part_path, dst)
+    refresh_disk_metrics()
+    elapsed_all = max(time.time() - progress["start_t"], 0.1)
+    avg_mb_s = (progress["new_bytes"] / (1024 ** 2)) / elapsed_all
+    log(f"[HF] 并发下载完成: {dst.name} ({total / (1024**3):.2f} GiB, 均速 {avg_mb_s:.1f} MB/s)")
+    return dst
+
+
+def _get_drive_api_token(force_refresh: bool = False) -> Optional[str]:
+    """Acquire (or force-refresh) an OAuth access token with Drive scope on Colab VM.
+
+    Checks in order:
+      1. `COLABD_DRIVE_ACCESS_TOKEN` env var (for tests / explicit injection).
+      2. `google.auth.default(scopes=[drive])` (standard ADC chain).
+      3. Persistent Colab / gcloud ADC files on disk (`/content/.config/application_default_credentials.json`,
+         `~/.config/gcloud/application_default_credentials.json`) so auth survives `colab restart-kernel`.
+    """
+    env_tok = os.environ.get("COLABD_DRIVE_ACCESS_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    try:
+        import google.auth  # type: ignore
+        from google.auth.transport.requests import Request as _GReq  # type: ignore
+
+        creds, _ = google.auth.default(scopes=scopes)
+        if force_refresh or not creds.valid or not creds.token:
+            creds.refresh(_GReq())
+        if creds.token:
+            return str(creds.token)
+    except Exception:
+        pass
+
+    try:
+        from google.oauth2.credentials import Credentials as _GUserCreds  # type: ignore
+        from google.auth.transport.requests import Request as _GReq  # type: ignore
+
+        adc_candidates = [
+            Path(os.environ.get("COLABD_VM_ADC_FILE", "/content/.config/application_default_credentials.json")),
+            Path.home() / ".config" / "gcloud" / "application_default_credentials.json",
+        ]
+        for cand in adc_candidates:
+            if not cand.is_file():
+                continue
+            try:
+                creds = _GUserCreds.from_authorized_user_file(str(cand), scopes=scopes)
+                if force_refresh or not creds.valid or not creds.token:
+                    creds.refresh(_GReq())
+                if creds.token:
+                    return str(creds.token)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if os.environ.get("COLABD_DISABLE_GCLOUD_TOKEN_FALLBACK") != "1" and shutil.which("gcloud"):
+        try:
+            tok = subprocess.check_output(
+                ["gcloud", "auth", "print-access-token"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=15,
+            ).strip()
+            if tok:
+                return tok
+        except Exception:
+            pass
+    return None
+
+
+def _drive_api_request_json(token: str, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cur_token = token
+    data_bytes: Optional[bytes] = json.dumps(body).encode("utf-8") if body is not None else None
+    last_exc: Optional[BaseException] = None
+    refreshed_401 = False
+    for attempt in range(4):
+        headers = {"Authorization": f"Bearer {cur_token}", "User-Agent": "colabd/0.2"}
+        if data_bytes is not None:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        try:
+            req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                raw = resp.read().decode("utf-8", errors="replace").strip()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code == 401 and not refreshed_401:
+                new_tok = _get_drive_api_token(force_refresh=True)
+                if new_tok:
+                    cur_token = new_tok
+                    refreshed_401 = True
+                    continue
+            if exc.code in (429, 500, 502, 503, 504) and attempt < 3:
+                time.sleep(min(15.0, 2.0 * (2 ** attempt)))
+                continue
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"Drive API {method} {url} 失败 (HTTP {exc.code}): {detail}") from exc
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 3:
+                time.sleep(min(10.0, 1.5 * (2 ** attempt)))
+                continue
+            raise
+    raise RuntimeError(f"Drive API 请求重试耗尽: {last_exc}")
+
+
+def _escape_drive_q(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _drive_ensure_folder_path(token: str, folder_parts: List[str]) -> str:
+    parent_id = "root"
+    walked: List[str] = []
+    for part in folder_parts:
+        walked.append(part)
+        key = tuple(walked)
+        if key in _drive_folder_cache:
+            parent_id = _drive_folder_cache[key]
+            continue
+        q = (
+            f"name='{_escape_drive_q(part)}' and '{parent_id}' in parents "
+            "and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        )
+        qs = urllib.parse.urlencode({"q": q, "fields": "files(id,name)", "pageSize": "5"})
+        res = _drive_api_request_json(token, "GET", f"{DRIVE_API_BASE}/files?{qs}")
+        files = res.get("files") or []
+        if files and files[0].get("id"):
+            parent_id = str(files[0]["id"])
+        else:
+            created = _drive_api_request_json(
+                token,
+                "POST",
+                f"{DRIVE_API_BASE}/files?fields=id",
+                {
+                    "name": part,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent_id],
+                },
+            )
+            parent_id = str(created["id"])
+        _drive_folder_cache[key] = parent_id
+    return parent_id
+
+
+def _drive_find_file(token: str, parent_id: str, filename: str) -> Optional[Dict[str, Any]]:
+    q = f"name='{_escape_drive_q(filename)}' and '{parent_id}' in parents and trashed=false"
+    qs = urllib.parse.urlencode({"q": q, "fields": "files(id,name,size,md5Checksum)", "pageSize": "5"})
+    res = _drive_api_request_json(token, "GET", f"{DRIVE_API_BASE}/files?{qs}")
+    files = res.get("files") or []
+    return files[0] if files else None
+
+
+def _drive_start_resumable_session(
+    token: str,
+    parent_id: str,
+    filename: str,
+    total: Optional[int],
+    existing_file_id: Optional[str] = None,
+) -> str:
+    if existing_file_id:
+        url = f"{DRIVE_UPLOAD_BASE}/files/{existing_file_id}?uploadType=resumable&fields=id,name,size"
+        method = "PATCH"
+        meta_body: Dict[str, Any] = {"name": filename}
+    else:
+        url = f"{DRIVE_UPLOAD_BASE}/files?uploadType=resumable&fields=id,name,size"
+        method = "POST"
+        meta_body = {"name": filename, "parents": [parent_id]}
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Upload-Content-Type": "application/octet-stream",
+        "User-Agent": "colabd/0.2",
+    }
+    if total is not None:
+        headers["X-Upload-Content-Length"] = str(total)
+    req = urllib.request.Request(url, data=json.dumps(meta_body).encode("utf-8"), headers=headers, method=method)
+    with _NO_REDIRECT_OPENER.open(req, timeout=45) as resp:
+        loc = resp.headers.get("Location") or resp.headers.get("location")
+        if not loc:
+            raise RuntimeError("Drive Resumable Upload 未返回 Location 上传会话地址")
+        return loc
+
+
+def _drive_query_resumable_offset(token: str, upload_uri: str, total: Optional[int]) -> int:
+    total_str = str(total) if total is not None else "*"
+    req = urllib.request.Request(
+        upload_uri,
+        data=b"",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Length": "0",
+            "Content-Range": f"bytes */{total_str}",
+        },
+        method="PUT",
+    )
+    try:
+        with _NO_REDIRECT_OPENER.open(req, timeout=30) as resp:
+            if 200 <= getattr(resp, "status", 200) < 300 and total is not None:
+                return total
+            return 0
+    except urllib.error.HTTPError as exc:
+        if exc.code == 308:
+            rng = exc.headers.get("Range") or exc.headers.get("range") or ""
+            m = re.search(r"bytes=0-(\d+)", rng)
+            return (int(m.group(1)) + 1) if m else 0
+        raise
+
+
+def _read_exact_chunk(stream: Any, size: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < size:
+        part = stream.read(size - len(buf))
+        if not part:
+            break
+        buf.extend(part)
+    return bytes(buf)
+
+
+def stream_hf_to_drive_api(
+    repo: str,
+    filename: str,
+    dst: Path,
+    token: str,
+    optional: bool = False,
+) -> Optional[Path]:
+    """Stream HF file directly into Google Drive via REST API v3 Resumable Upload (0 bytes local cache)."""
+    rel_parts = _drive_rel_parts(dst)
+    if not rel_parts:
+        raise RuntimeError(f"无法解析 {dst} 相对 {DRIVE_MOUNT_ROOT} 的云盘路径")
+
+    url = _hf_resolve_url(repo, filename)
+    total, _supports_range, final_url, skipped = _probe_hf_file(url, optional=optional)
+    if skipped:
+        log(f"[HF][INFO] 可选伴随文件 {repo}/{filename} 不存在，跳过。")
+        return None
+
+    folder_parts = rel_parts[:-1]
+    remote_name = rel_parts[-1]
+    parent_id = _drive_ensure_folder_path(token, folder_parts)
+    existing = _drive_find_file(token, parent_id, remote_name)
+    if existing and total is not None:
+        try:
+            if int(existing.get("size", -1)) == total and total > 0:
+                log(
+                    f"[DRIVE-API] 云盘已存在完整文件，原地复用跳过传输: "
+                    f"{'/'.join(rel_parts)} ({total / (1024**3):.2f} GiB)"
+                )
+                return dst
+        except (TypeError, ValueError):
+            pass
+
+    existing_id = str(existing["id"]) if existing and existing.get("id") else None
+    upload_uri = _drive_start_resumable_session(token, parent_id, remote_name, total, existing_file_id=existing_id)
+
+    total_disp = f"{total / (1024**3):.2f} GiB" if total else "未知大小"
+    log(f"[DRIVE-API] 开始 0 本地缓存流式直传至 Google Drive: {'/'.join(rel_parts)} ({total_disp})...")
+    emit_telemetry(
+        phase=f"Drive API 流式直传 {remote_name}",
+        drive_io_state="streaming_api",
+        drive_io_detail=f"流式直传 {remote_name} (0 本地缓存)",
+    )
+
+    offset = 0
+    start_t = time.time()
+    last_report = start_t
+    resp_meta: Dict[str, Any] = {}
+    hf_resp = None
+
+    def open_hf_at(byte_offset: int) -> Any:
+        hdrs = _hf_headers({"Range": f"bytes={byte_offset}-"} if byte_offset > 0 else None)
+        req = urllib.request.Request(final_url, headers=hdrs)
+        return urllib.request.urlopen(req, timeout=60)
+
+    try:
+        hf_resp = open_hf_at(0)
+        while True:
+            chunk = _read_exact_chunk(hf_resp, DRIVE_API_CHUNK_BYTES)
+            if not chunk:
+                if total is not None and offset < total:
+                    raise IOError(f"HF 响应流提前结束 ({offset} < {total})")
+                break
+
+            chunk_len = len(chunk)
+            chunk_start = offset
+            chunk_end = offset + chunk_len - 1
+            is_final = (total is not None and (chunk_end + 1) >= total) or (chunk_len < DRIVE_API_CHUNK_BYTES)
+            cr_total = str(total) if total is not None else (str(chunk_end + 1) if is_final else "*")
+
+            uploaded_ok = False
+            for attempt in range(5):
+                put_req = urllib.request.Request(
+                    upload_uri,
+                    data=chunk,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Length": str(chunk_len),
+                        "Content-Range": f"bytes {chunk_start}-{chunk_end}/{cr_total}",
+                    },
+                    method="PUT",
+                )
+                try:
+                    with _NO_REDIRECT_OPENER.open(put_req, timeout=120) as uresp:
+                        raw = uresp.read().decode("utf-8", errors="replace").strip()
+                        resp_meta = json.loads(raw) if raw else {}
+                        offset = chunk_end + 1
+                        uploaded_ok = True
+                        break
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 308:
+                        rng = exc.headers.get("Range") or exc.headers.get("range") or ""
+                        m = re.search(r"bytes=0-(\d+)", rng)
+                        offset = (int(m.group(1)) + 1) if m else (chunk_end + 1)
+                        uploaded_ok = True
+                        break
+                    if exc.code == 401 and attempt < 4:
+                        # OAuth access token expires after ~60m during multi-hour 100GB+ uploads: auto-refresh!
+                        new_tok = _get_drive_api_token(force_refresh=True)
+                        if new_tok:
+                            token = new_tok
+                            log("[DRIVE-API] 访问令牌已过期 (HTTP 401)，已自动刷新令牌并继续分块上传...")
+                            acked = _drive_query_resumable_offset(token, upload_uri, total)
+                            if acked != chunk_start:
+                                offset = acked
+                                hf_resp.close()
+                                hf_resp = open_hf_at(offset)
+                                uploaded_ok = True
+                                break
+                            continue
+                    if exc.code in (429, 500, 502, 503, 504) and attempt < 4:
+                        time.sleep(min(20.0, 2.0 * (2 ** attempt)))
+                        acked = _drive_query_resumable_offset(token, upload_uri, total)
+                        if acked != chunk_start:
+                            offset = acked
+                            hf_resp.close()
+                            hf_resp = open_hf_at(offset)
+                            uploaded_ok = True
+                            break
+                        continue
+                    err_body = exc.read().decode("utf-8", errors="replace")[:300]
+                    raise RuntimeError(f"Drive API 分块上传失败 (HTTP {exc.code}): {err_body}") from exc
+                except Exception as exc:
+                    if attempt < 4:
+                        time.sleep(min(20.0, 2.0 * (2 ** attempt)))
+                        acked = _drive_query_resumable_offset(token, upload_uri, total)
+                        if acked != chunk_start:
+                            offset = acked
+                            hf_resp.close()
+                            hf_resp = open_hf_at(offset)
+                            uploaded_ok = True
+                            break
+                        continue
+                    raise RuntimeError(f"Drive API 流式直传连接异常: {exc}") from exc
+
+            if not uploaded_ok:
+                raise RuntimeError(f"Drive API 上传分块 {chunk_start}-{chunk_end} 重试耗尽")
+
+            now = time.time()
+            if now - last_report >= 4.0 or (total is not None and offset >= total):
+                mb_s = (offset / (1024 ** 2)) / max(now - start_t, 0.1)
+                if total and total > 0:
+                    pct = min(100.0, (offset / total) * 100.0)
+                    msg = f"{remote_name}: {pct:.1f}% ({offset/(1024**3):.2f}/{total/(1024**3):.2f} GiB, {mb_s:.1f} MB/s)"
+                else:
+                    msg = f"{remote_name}: {offset/(1024**3):.2f} GiB ({mb_s:.1f} MB/s)"
+                log(f"[DRIVE-API] {msg}")
+                emit_telemetry(drive_io_state="streaming_api", drive_io_detail=msg)
+                refresh_disk_metrics()
+                last_report = now
+
+            if resp_meta:
+                break
+    finally:
+        if hf_resp is not None:
+            try:
+                hf_resp.close()
+            except Exception:
+                pass
+
+    if total is not None and resp_meta.get("size") is not None:
+        if int(resp_meta["size"]) != total:
+            raise IOError(f"Drive API 服务端落盘字节数校验不一致 ({resp_meta['size']} != {total})")
+
+    # Wait briefly for FUSE mount metadata to reflect newly uploaded object
+    if DRIVE_MOUNT_ROOT.exists() and not dst.exists():
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if dst.exists():
+                break
+            time.sleep(0.5)
+
+    emit_telemetry(
+        drive_io_state="ready",
+        drive_io_detail=f"Drive API 已确认落盘: {remote_name}",
+    )
+    log(f"[DRIVE-API] 服务端 HTTP 200 真落盘完成: {'/'.join(rel_parts)} ({offset / (1024**3):.2f} GiB, 0 本地缓存)")
+    return dst
+
+
+def _wait_for_local_disk_headroom(filename: str) -> None:
+    """Pause FUSE direct-write if VM local root disk drops below watermark while DriveFS drains its cache."""
+    target_local = WORK_DIR if WORK_DIR.exists() else Path("/")
+    waited = 0.0
+    warned = False
+    while True:
+        local_free_gb = shutil.disk_usage(target_local).free / (1024 ** 3)
+        if local_free_gb >= FUSE_MIN_LOCAL_FREE_GB:
+            if warned:
+                log(f"[DRIVE-FUSE] 本地根盘余量已恢复至 {local_free_gb:.1f} GiB，继续写入 {filename}。")
+            return
+        dfs_gb = _measure_drivefs_cache_gb()
+        if not warned:
+            log(
+                f"[DRIVE-FUSE][背压暂停] 本地根盘仅剩 {local_free_gb:.1f} GiB "
+                f"(< {FUSE_MIN_LOCAL_FREE_GB:.0f} GiB 警戒线 | DriveFS缓存={dfs_gb:.1f} GiB)，"
+                f"暂停写入 {filename} 等待 DriveFS 上传释放本地缓存..."
+            )
+            warned = True
+        emit_telemetry(
+            local_free_gb=round(local_free_gb, 1),
+            drivefs_cache_gb=dfs_gb,
+            drive_io_state="writing_fuse",
+            drive_io_detail=f"背压等待 DriveFS 释放缓存 (本地余 {local_free_gb:.1f} GiB)",
+        )
+        if waited >= FUSE_BACKPRESSURE_MAX_WAIT_SEC:
+            if local_free_gb < FUSE_CRITICAL_LOCAL_FREE_GB:
+                raise RuntimeError(
+                    f"本地根盘持续低于临界水位 ({local_free_gb:.1f} GiB < {FUSE_CRITICAL_LOCAL_FREE_GB:.0f} GiB)，"
+                    "为防止 DriveFS 写缓存撑爆 VM 已中止写入。建议开启 colab auth 改用 Drive API 0 缓存直传。"
+                )
+            log(
+                f"[DRIVE-FUSE][WARN] 等待 {waited:.0f}s 后本地余量仍为 {local_free_gb:.1f} GiB "
+                f"(高于临界线 {FUSE_CRITICAL_LOCAL_FREE_GB:.0f} GiB)，继续低速写入。"
+            )
+            return
+        step = min(2.0, max(0.05, FUSE_BACKPRESSURE_MAX_WAIT_SEC - waited))
+        time.sleep(step)
+        waited += step
+
+
+def _download_hf_fuse_direct(repo: str, filename: str, dst: Path, optional: bool = False) -> Optional[Path]:
+    """Sequential direct-write to Google Drive FUSE mount with local disk watermark backpressure."""
+    global _wrote_via_fuse
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    url = _hf_resolve_url(repo, filename)
+    total, _supports_range, final_url, skipped = _probe_hf_file(url, optional=optional)
+    if skipped:
+        log(f"[HF][INFO] 可选伴随文件 {repo}/{filename} 不存在，跳过。")
+        return None
+
+    existing = dst.stat().st_size if (dst.exists() and not dst.is_symlink()) else 0
+    if total is not None and total > 0 and existing == total:
+        log(f"[DRIVE-FUSE] 云盘已存在完整文件，原地复用跳过下载: {dst.name} ({total / (1024**3):.2f} GiB)")
+        return dst
+    if total is not None and existing > total:
+        existing = 0
+
+    drive_free = shutil.disk_usage(dst.parent).free
+    need_rem = (total - existing) if (total is not None and total > existing) else 0
+    if need_rem > 0 and drive_free < need_rem + (1 * 1024 ** 3):
+        raise RuntimeError(
+            f"Google Drive 剩余配额不足 ({drive_free / (1024**3):.1f} GiB < 所需 {need_rem / (1024**3):.1f} GiB)，"
+            f"无法直落写入 {dst.name}"
+        )
+
+    _wait_for_local_disk_headroom(dst.name)
+
+    req_headers = _hf_headers({"Range": f"bytes={existing}-"} if existing > 0 else None)
+    req = urllib.request.Request(final_url, headers=req_headers)
+    resp = urllib.request.urlopen(req, timeout=60)
+    with resp:
+        status = getattr(resp, "status", 200)
+        if existing > 0 and status != 206:
+            existing = 0
+        mode = "ab" if existing > 0 and status == 206 else "wb"
+        log(
+            f"[DRIVE-FUSE] 开始顺序直写至 Google Drive: {dst.name} "
+            f"({(total or 0) / (1024**3):.2f} GiB, 带本地盘水位背压)..."
+        )
+        emit_telemetry(
+            phase=f"FUSE 直写云盘 {dst.name}",
+            drive_io_state="writing_fuse",
+            drive_io_detail=f"FUSE 顺序直写 {dst.name}",
+        )
+        _wrote_via_fuse = True
+        written = existing
+        since_check = 0
+        start_t = time.time()
+        last_report = start_t
+        buf_size = 8 * 1024 * 1024
+
+        with dst.open(mode) as fh:
+            while True:
+                chunk = resp.read(buf_size)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                written += len(chunk)
+                since_check += len(chunk)
+                if since_check >= 64 * 1024 * 1024:
+                    fh.flush()
+                    _wait_for_local_disk_headroom(dst.name)
+                    since_check = 0
+                now = time.time()
+                if now - last_report >= 4.0:
+                    mb_s = ((written - existing) / (1024 ** 2)) / max(now - start_t, 0.1)
+                    if total and total > 0:
+                        pct = min(100.0, (written / total) * 100.0)
+                        msg = f"FUSE {dst.name}: {pct:.1f}% ({written/(1024**3):.2f}/{total/(1024**3):.2f} GiB, {mb_s:.1f} MB/s)"
+                    else:
+                        msg = f"FUSE {dst.name}: {written/(1024**3):.2f} GiB ({mb_s:.1f} MB/s)"
+                    log(f"[DRIVE-FUSE] {msg}")
+                    emit_telemetry(drive_io_state="writing_fuse", drive_io_detail=msg)
+                    refresh_disk_metrics()
+                    last_report = now
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+
+    if total is not None and dst.stat().st_size != total:
+        raise IOError(f"FUSE 直写 {dst.name} 字节数不完整 ({dst.stat().st_size} != {total})")
+    refresh_disk_metrics()
+    emit_telemetry(
+        drive_io_state="ready",
+        drive_io_detail=f"FUSE 写入完成: {dst.name} (DriveFS 缓存 {_measure_drivefs_cache_gb():.1f} GiB)",
+    )
+    log(f"[DRIVE-FUSE] 直写完成: {dst.name} ({dst.stat().st_size / (1024**3):.2f} GiB)")
+    return dst
+
+
+def download_hf_file(repo: str, filename: str, dst: Path, optional: bool = False) -> Optional[Path]:
+    """Download a file from Hugging Face directly to its target storage (local NVMe or Google Drive)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Route Drive-bound targets through Direct-to-Drive channels (API streaming or FUSE + backpressure)
+    if _is_on_drive_mount(dst):
+        if DRIVE_WRITE_MODE == "fuse":
+            return _download_hf_fuse_direct(repo, filename, dst, optional=optional)
+        token = _get_drive_api_token()
+        if token:
+            return stream_hf_to_drive_api(repo, filename, dst, token=token, optional=optional)
+        if DRIVE_WRITE_MODE == "api_stream":
+            raise RuntimeError(
+                "当前已强制设置为 Drive API 流式直传 (DRIVE_WRITE_MODE=api_stream)，但远端未获取到 Drive API OAuth 令牌。"
+                "请先执行 'colab auth' 注入远端凭证，或将设置 [4] 切换为 auto / fuse。"
+            )
+        log("[DRIVE] 未检测到远端 Drive API 令牌，自动回退至 FUSE 顺序直写 + 本地水位背压模式。")
+        return _download_hf_fuse_direct(repo, filename, dst, optional=optional)
+
+    # Local NVMe fast path: skip if already present, else multi-threaded Range download
+    if dst.exists() and not dst.is_symlink() and dst.stat().st_size > 0:
+        log(f"[HF] 命中本地 NVMe 文件，跳过下载: {dst.name} ({dst.stat().st_size / (1024**3):.2f} GiB)")
+        return dst
+
+    url = _hf_resolve_url(repo, filename)
+    if HF_DOWNLOAD_CONCURRENCY > 1:
+        total, supports_range, final_url, skipped = _probe_hf_file(url, optional=optional)
+        if skipped:
+            log(f"[HF][INFO] 可选伴随文件 {repo}/{filename} 不存在，跳过。")
+            return None
+        if supports_range and total is not None and total >= MULTIPART_MIN_BYTES:
+            return _download_hf_local_multipart(final_url, dst, total, HF_DOWNLOAD_CONCURRENCY)
+        return _download_hf_local_single(final_url, dst, optional=optional)
+
+    return _download_hf_local_single(url, dst, optional=optional)
+
+
 def discover_hf_repo_files(repo: str) -> List[str]:
-    url = f"https://huggingface.co/api/models/{repo}"
+    url = f"{HF_BASE_URL}/api/models/{repo}"
     req = urllib.request.Request(url, headers=_hf_headers())
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -640,8 +1321,32 @@ def discover_hf_repo_files(repo: str) -> List[str]:
     return [str(s["rfilename"]) for s in siblings if isinstance(s, dict) and s.get("rfilename")]
 
 
+def ensure_hf_subdir_files(repo: str, subdir: str, target_dir: Path) -> int:
+    """Download all valid model/config files under `subdir/` of `repo` directly into `target_dir`."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    prefix = subdir.strip("/") + "/"
+    files = discover_hf_repo_files(repo)
+    matched = [
+        f
+        for f in sorted(files)
+        if f.startswith(prefix)
+        and not Path(f).name.startswith(".")
+        and Path(f).suffix.lower() in SHARD_SUFFIXES
+    ]
+    if not matched:
+        log(f"[HF][WARN] 仓库 {repo} 子目录 '{subdir}' 未发现可识别权重分片，将交由引擎自行下载。")
+        return 0
+    log(f"[HF] 在 {repo}/{subdir} 发现 {len(matched)} 个文件，直接下载至目标目录 ({target_dir})...")
+    done_cnt = 0
+    for rf in matched:
+        rel_sub = rf[len(prefix) :]
+        if download_hf_file(repo, rf, target_dir / rel_sub, optional=False) is not None:
+            done_cnt += 1
+    return done_cnt
+
+
 def ensure_hf_model_files(repo: str, model_file: str, extra_files: List[str], target_dir: Path) -> Path:
-    """Download required HF files into target_dir and return path to primary model file/dir."""
+    """Download required HF files directly into target_dir and return path to primary model file/dir."""
     target_dir.mkdir(parents=True, exist_ok=True)
     primary_path: Optional[Path] = None
 
@@ -772,18 +1477,22 @@ def prepare_storage_and_deps() -> Tuple[Path, bool]:
 
     if STORAGE_MODE == "drive_full":
         if not drive_available:
-            log("[REMOTE][ERROR] 未检测到挂载的 Google Drive (/content/drive/MyDrive)，无法运行 drive_full 模式。")
+            log("[REMOTE][ERROR] 未检测到挂载的 Google Drive (/content/drive/MyDrive)，无法运行 drive_full 扩容模式。")
             sys.exit(2)
         models_dir = drive_root
         models_dir.mkdir(parents=True, exist_ok=True)
-        log(f"[REMOTE] 存储拓扑: 全量云盘直连 ({models_dir})")
+        emit_telemetry(
+            drive_io_state="ready",
+            drive_io_detail=f"全量云盘扩容直落模式 ({DRIVE_WRITE_MODE})",
+        )
+        log(f"[REMOTE] 存储拓扑: 全量云盘扩容 drive_full ({models_dir}，原地复用 / 缺失直接下载到云盘)")
 
     elif STORAGE_MODE == "nvme_engram":
         if is_ds4 and not drive_available:
             local_free_gb = shutil.disk_usage(WORK_DIR if WORK_DIR.exists() else Path("/")).free / (1024 ** 3)
             if local_free_gb < 280.0:
                 log(
-                    f"[REMOTE][ERROR] nvme_engram 模式依赖 Google Drive 挂载主权重，但未检测到 {DRIVE_MOUNT_ROOT} "
+                    f"[REMOTE][ERROR] nvme_engram 扩容模式依赖 Google Drive 存放主权重，但未检测到 {DRIVE_MOUNT_ROOT} "
                     f"(且本地盘仅剩 {local_free_gb:.1f} GiB < 280 GiB)，已中止以防写爆磁盘。"
                 )
                 sys.exit(2)
@@ -799,37 +1508,27 @@ def prepare_storage_and_deps() -> Tuple[Path, bool]:
                 ablit_parent.mkdir(parents=True, exist_ok=True)
                 ensure_symlink(ablit_parent / "Engram-Q6_K", engram_nvme)
 
-            if DRIVE_PREFETCH and drive_available:
-                prefetch_dir_from_drive(
-                    [
-                        drive_root / "Engram-Q6_K",
-                        drive_root / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Engram-Q6_K",
-                    ],
-                    engram_nvme,
-                    "Engram-Q6_K 条件记忆表",
-                )
-
             if model_rel_sub and drive_available:
                 drive_weight_dir = drive_root / model_rel_sub
                 local_weight_link = models_dir / model_rel_sub
-                save_weights = DRIVE_SAVE_POLICY in ("both", "weights_only")
-                has_cached_weights = len(list_valid_shards(drive_weight_dir)) > 0
-
-                if save_weights or (DRIVE_PREFETCH and has_cached_weights):
-                    ensure_symlink(local_weight_link, drive_weight_dir)
-                    if has_cached_weights:
-                        log(f"[CACHE] 在云盘命中主权重分片 ({drive_weight_dir})，启动时将直接顺序载入显存+内存。")
-                    else:
-                        log(f"[CACHE] 云盘暂无主权重缓存，稍后回退下载并将直接持久化保存至云盘 ({drive_weight_dir})。")
-        else:
-            if DRIVE_PREFETCH and drive_available and model_rel_sub:
-                prefetch_dir_from_drive([drive_root / model_rel_sub], models_dir / model_rel_sub, MODEL_PRESET)
-
-        log(f"[REMOTE] 存储拓扑: 反向跨盘 nvme_engram (本地 NVMe={models_dir}, Engram 常驻高速盘)")
+                ensure_symlink(local_weight_link, drive_weight_dir)
+                existing_shards = list_valid_shards(drive_weight_dir)
+                if existing_shards:
+                    log(
+                        f"[DRIVE] 云盘已有 {len(existing_shards)} 个主权重文件 ({drive_weight_dir})，"
+                        "将原地复用并在启动时顺序载入显存+内存。"
+                    )
+                else:
+                    log(f"[DRIVE] 云盘暂无主权重文件，缺失分片将直接下载至云盘目录 ({drive_weight_dir})。")
+        emit_telemetry(
+            drive_io_state="ready" if drive_available else "disabled",
+            drive_io_detail=f"反向跨盘扩容: 主权重直落云盘 ({DRIVE_WRITE_MODE}) / Engram 直落 NVMe",
+        )
+        log(f"[REMOTE] 存储拓扑: 反向跨盘扩容 nvme_engram (本地 NVMe={models_dir}, 主权重软链直落云盘)")
 
     elif STORAGE_MODE == "drive_engram":
         if not drive_available:
-            log("[REMOTE][ERROR] 未检测到挂载的 Google Drive，无法运行 drive_engram 模式。")
+            log("[REMOTE][ERROR] 未检测到挂载的 Google Drive，无法运行 drive_engram 扩容模式。")
             sys.exit(2)
         models_dir = Path(CUSTOM_MODELS_DIR)
         models_dir.mkdir(parents=True, exist_ok=True)
@@ -842,35 +1541,28 @@ def prepare_storage_and_deps() -> Tuple[Path, bool]:
                 models_dir / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Engram-Q6_K",
                 drive_engram,
             )
-        if DRIVE_PREFETCH and model_rel_sub:
-            prefetch_dir_from_drive([drive_root / model_rel_sub], models_dir / model_rel_sub, "主模型权重")
-        log(f"[REMOTE] 存储拓扑: 正向跨盘 drive_engram (本地主权重={models_dir}, 云盘软链 Engram={drive_engram})")
+        emit_telemetry(
+            drive_io_state="ready",
+            drive_io_detail=f"正向跨盘扩容: 外挂查表直落云盘 ({DRIVE_WRITE_MODE}) / 主权重直落 NVMe",
+        )
+        log(f"[REMOTE] 存储拓扑: 正向跨盘扩容 drive_engram (本地主权重={models_dir}, 外挂表软链云盘={drive_engram})")
 
     else:
         models_dir = Path(CUSTOM_MODELS_DIR)
         models_dir.mkdir(parents=True, exist_ok=True)
         cleanup_temp_files(models_dir)
-
-        if DRIVE_PREFETCH and drive_available:
-            if is_ds4:
-                engram_nvme = models_dir / "Engram-Q6_K"
-                engram_nvme.mkdir(parents=True, exist_ok=True)
-                if is_ds4_ablit:
-                    ensure_symlink(
-                        models_dir / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Engram-Q6_K",
-                        engram_nvme,
-                    )
-                prefetch_dir_from_drive(
-                    [
-                        drive_root / "Engram-Q6_K",
-                        drive_root / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Engram-Q6_K",
-                    ],
-                    engram_nvme,
-                    "Engram-Q6_K 条件记忆表",
-                )
-            if model_rel_sub:
-                prefetch_dir_from_drive([drive_root / model_rel_sub], models_dir / model_rel_sub, "主模型权重")
-        log(f"[REMOTE] 存储拓扑: 纯本地高速盘 local_nvme ({models_dir})")
+        if is_ds4 and is_ds4_ablit:
+            engram_nvme = models_dir / "Engram-Q6_K"
+            engram_nvme.mkdir(parents=True, exist_ok=True)
+            ensure_symlink(
+                models_dir / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Engram-Q6_K",
+                engram_nvme,
+            )
+        emit_telemetry(
+            drive_io_state="disabled",
+            drive_io_detail="纯本地高速 NVMe (未挂载云盘)",
+        )
+        log(f"[REMOTE] 存储拓扑: 纯本地高速盘 local_nvme ({models_dir}, {HF_DOWNLOAD_CONCURRENCY} 线程并发直连 HF)")
 
     emit_telemetry(models_dir=str(models_dir))
     refresh_disk_metrics()
@@ -975,10 +1667,9 @@ def start_tunnel() -> None:
     ready.wait(timeout=25)
 
 
-def health_and_sync_poller(models_dir: Path, maya_dir: Path, ram_resident: bool) -> None:
+def health_poller(maya_dir: Path, ram_resident: bool) -> None:
     url = f"http://127.0.0.1:{MAYA_PORT}/health"
     was_healthy = False
-    sync_triggered = False
     engine_name = "Strata" if ENGINE_TYPE == "strata" else "Project Maya"
 
     while not _stop_event.is_set():
@@ -1001,13 +1692,6 @@ def health_and_sync_poller(models_dir: Path, maya_dir: Path, ram_resident: bool)
                 patch_existing_maya_configs(maya_dir, ram_resident)
             emit_telemetry(api_healthy=True, phase="在线服务中 (Ready)")
             log(f"\n[REMOTE] >>> {engine_name} 推理引擎已就绪，可开始接收 API 请求！ <<<\n")
-            if not sync_triggered:
-                sync_triggered = True
-                threading.Thread(
-                    target=sync_new_shards_to_drive,
-                    args=(models_dir,),
-                    daemon=True,
-                ).start()
         elif not ok and state == "loading" and not was_healthy:
             emit_telemetry(api_healthy=False, phase="模型权重加载入显存中...")
         elif not ok and was_healthy:
@@ -1278,6 +1962,8 @@ def run_strata(models_dir: Path) -> int:
     env = os.environ.copy()
     env["STRATA_DATA_DIR"] = str(strata_data_dir)
     env["STRATA_API_KEY"] = MAYA_API_KEY
+    env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    env["HF_XET_HIGH_PERFORMANCE"] = "1"
     if HF_TOKEN:
         env["HF_TOKEN"] = HF_TOKEN
 
@@ -1436,14 +2122,33 @@ def run_maya(models_dir: Path, ram_resident: bool) -> int:
     if hf_repo:
         rel_sub = MODEL_SUBDIRS.get(MODEL_PRESET, "Custom-Maya")
         local_target = models_dir / rel_sub
-        emit_telemetry(phase=f"拉取/校验自定义 Hugging Face 权重 ({hf_repo})")
+        emit_telemetry(phase=f"直落下载自定义 Hugging Face 权重 ({hf_repo})")
         ensure_hf_model_files(hf_repo, str(maya_spec.get("model_file") or ""), [], local_target)
         custom_model_dir = local_target
+    else:
+        # For built-in large presets whose main weights live on Google Drive (nvme_engram / drive_full),
+        # stream missing main weight shards directly to Drive FIRST while local NVMe is still empty!
+        direct_cfg = maya_spec.get("drive_direct_hf")
+        model_rel_sub = MODEL_SUBDIRS.get(MODEL_PRESET, "")
+        if isinstance(direct_cfg, dict) and model_rel_sub:
+            weight_target = models_dir / model_rel_sub
+            if _is_on_drive_mount(weight_target):
+                d_repo = str(direct_cfg.get("hf_repo") or "").strip()
+                d_sub = str(direct_cfg.get("hf_subdir") or "").strip()
+                if d_repo and d_sub:
+                    emit_telemetry(phase=f"直落主权重至云盘 ({d_repo}/{d_sub})")
+                    log(
+                        f"[DRIVE] 检测到主权重归属 Google Drive ({weight_target})，"
+                        "优先直落主权重（避免与本地 Engram 争抢空间）..."
+                    )
+                    ensure_hf_subdir_files(d_repo, d_sub, weight_target)
 
     patch_existing_maya_configs(maya_dir, ram_resident)
 
     env = os.environ.copy()
     env["MAYA_UPDATE_CHECK"] = "0"
+    env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    env["HF_XET_HIGH_PERFORMANCE"] = "1"
     if not WEB_UI:
         env["MAYA_WEB_UI"] = "0"
     if HF_TOKEN:
@@ -1452,7 +2157,7 @@ def run_maya(models_dir: Path, ram_resident: bool) -> int:
     need_prestart_patch = MAYA_ABLATION == "on" and MAYA_ABLATE_DEFAULT == "on"
     if need_prestart_patch:
         setup_cmd = build_maya_cmd(models_dir, ram_resident, custom_model_dir=custom_model_dir, no_start=True)
-        emit_telemetry(phase="校验本地分片 / 编译引擎 / 注入全局去拒绝配置")
+        emit_telemetry(phase="校验分片 / 编译引擎 / 注入全局去拒绝配置")
         log("[REMOTE] 执行 Project Maya 初始化 (--no-start 以便首次即激活 --ablate-default on)...")
         rc = _stream_subprocess(setup_cmd, cwd=maya_dir, env=env)
         if rc != 0:
@@ -1472,8 +2177,8 @@ def run_maya(models_dir: Path, ram_resident: bool) -> int:
         return _stream_subprocess(serve_cmd, cwd=maya_dir, env=env)
 
     cmd = build_maya_cmd(models_dir, ram_resident, custom_model_dir=custom_model_dir, no_start=False)
-    emit_telemetry(phase="校验本地分片 / 回退下载缺失项 / 编译预热引擎")
-    log("[REMOTE] 执行 Project Maya 启动流水线 (命中本地或软链分片将直接通过 SHA256 复用，缺失项自动回退公网下载)...")
+    emit_telemetry(phase="校验分片 / 补齐缺失项 / 编译预热引擎")
+    log("[REMOTE] 执行 Project Maya 启动流水线 (已就绪分片将直接通过 SHA256 原地复用，缺失项直落目标盘下载)...")
     return _stream_subprocess(cmd, cwd=maya_dir, env=env)
 
 
@@ -1482,8 +2187,8 @@ def main() -> None:
     start_tunnel()
     maya_dir = WORK_DIR / "project-maya"
     threading.Thread(
-        target=health_and_sync_poller,
-        args=(models_dir, maya_dir, ram_resident),
+        target=health_poller,
+        args=(maya_dir, ram_resident),
         daemon=True,
     ).start()
     if ENGINE_TYPE == "strata":

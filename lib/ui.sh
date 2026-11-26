@@ -148,7 +148,7 @@ page_status() {
   refresh_colab_auth_status "" 0 || true
   while true; do
     clear 2>/dev/null || true
-    local phase gpu drv_ver ram_gb local_free drive_free models_dir api_ok ep ram_res sync_st sync_msg eng_telem eff_eng
+    local phase gpu drv_ver ram_gb local_free drive_free models_dir api_ok ep ram_res dio_st dio_msg dfs_gb eng_telem eff_eng
     phase="$(read_telemetry_field phase)"
     eng_telem="$(read_telemetry_field engine)"
     eff_eng="${eng_telem:-$(resolve_effective_engine "$MODEL_PRESET")}"
@@ -159,8 +159,9 @@ page_status() {
     drive_free="$(read_telemetry_field drive_free_gb)"
     models_dir="$(read_telemetry_field models_dir)"
     ram_res="$(read_telemetry_field ram_resident_active)"
-    sync_st="$(read_telemetry_field cache_sync_state)"
-    sync_msg="$(read_telemetry_field cache_sync_detail)"
+    dio_st="$(read_telemetry_field drive_io_state)"
+    dio_msg="$(read_telemetry_field drive_io_detail)"
+    dfs_gb="$(read_telemetry_field drivefs_cache_gb)"
     api_ok="$(read_telemetry_field api_healthy)"
     ep="$(resolve_current_endpoint)"
 
@@ -180,9 +181,13 @@ page_status() {
       echo "  专家内存常驻 : $( [[ "$ram_res" == "True" || "$ram_res" == "true" ]] && echo "${C_GREEN}已激活 (--mmap-experts off，零专家交换)${C_RESET}" || echo "默认按需映射 (${EXPERT_RAM_POLICY})" )"
       echo "  Maya 消融态  : $(maya_ablation_desc)"
     fi
-    echo "  远端磁盘余量 : 本地 /content 剩余 ${local_free:-未知} GiB | 云盘剩余 ${drive_free:-未挂载} GiB"
-    echo "  工作目录拓扑 : ${models_dir:-尚未挂载} (模式: ${STORAGE_MODE})"
-    echo "  云盘分片回存 : ${sync_msg:-等待模型就绪后检查} (${sync_st:-idle} | 策略: ${DRIVE_SAVE_POLICY})"
+    echo "  远端磁盘余量 : 本地 /content 剩余 ${local_free:-未知} GiB | 云盘剩余 ${drive_free:-未挂载} GiB$( [[ -n "$dfs_gb" && "$dfs_gb" != "0" && "$dfs_gb" != "0.0" ]] && echo " | DriveFS缓存 ${dfs_gb} GiB" )"
+    echo "  工作目录拓扑 : ${models_dir:-尚未初始化} (模式: ${STORAGE_MODE} | HF并发: ${HF_DOWNLOAD_CONCURRENCY} 线程)"
+    if [[ "$dio_st" == "disabled" || ( -z "$dio_st" && "$STORAGE_MODE" == "local_nvme" ) ]]; then
+      echo "  云盘直落通道 : 未启用 (纯本地高速 NVMe 模式，免挂云盘)"
+    else
+      echo "  云盘直落通道 : ${dio_msg:-等待扩容写入或原地复用} (${dio_st:-idle} | 策略: ${DRIVE_WRITE_MODE})"
+    fi
     echo ""
     echo "${C_BOLD}[服务与隧道连通性]${C_RESET}"
     echo "  暴露模式     : $(tunnel_desc "$TUNNEL_MODE")"
@@ -560,7 +565,7 @@ page_settings() {
     echo "     ${C_DIM}$(model_desc "$MODEL_PRESET")${C_RESET}"
     echo "  2) GPU 与内存规格   : ${C_GREEN}${GPU_TYPE}${C_RESET} (高内存 --high-mem: $( [[ "$HIGH_MEM" == "1" ]] && echo "开启" || echo "关闭 / Free 兼容" ))"
     echo "  3) 运行期存储拓扑   : ${C_GREEN}${STORAGE_MODE}${C_RESET} — $(storage_desc "$STORAGE_MODE")"
-    echo "  4) 云盘查找与回存   : 预查拉取=$( [[ "$DRIVE_PREFETCH" == "1" ]] && echo "${C_GREEN}开启${C_RESET}" || echo "关闭" ) | 回存策略=${C_GREEN}${DRIVE_SAVE_POLICY}${C_RESET} ($(save_policy_desc "$DRIVE_SAVE_POLICY"))"
+    echo "  4) 下载加速与云盘写 : HF并发=${C_GREEN}${HF_DOWNLOAD_CONCURRENCY}${C_RESET} 线程 | 云盘直落=${C_GREEN}${DRIVE_WRITE_MODE}${C_RESET} ($(drive_write_mode_desc "$DRIVE_WRITE_MODE"))"
     if [[ "$eff_eng" == "strata" ]]; then
       echo "  5) 引擎专属调优     : Strata [KV=${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} | 并发=${C_GREEN}${STRATA_PARALLEL}${C_RESET} | 构建=${C_GREEN}${STRATA_BUILD_FALLBACK}${C_RESET} | 投机=${MAYA_DRAFTING}]"
     else
@@ -605,12 +610,12 @@ page_settings() {
         ;;
       3)
         echo ""
-        echo "可选运行期存储拓扑 (均支持配合第 4 项的云盘预查找与回存):"
-        echo "  1) auto         : 智能匹配 (本地盘足够走 local_nvme，超大外挂表模型走反向跨盘 nvme_engram)"
-        echo "  2) nvme_engram  : 反向跨盘推荐 — 外挂查表拉取到本地高速 NVMe 跑 + 主权重挂云盘全进内存 (推理零网盘 I/O)"
-        echo "  3) drive_engram : 正向跨盘 — 主权重放本地 NVMe + 外挂查表软链在云盘上按需读取"
-        echo "  4) drive_full   : 全量云盘直连 — 所有权重与表均直接在 Google Drive 目录读写"
-        echo "  5) local_nvme   : 纯本地高速盘 — 所有文件在本地盘运行 (Free T4 / 轻模型推荐，仍可配合云盘拉取/回存)"
+        echo "可选运行期存储拓扑 (缺失文件直接下载至目标盘，原地复用、无后台回存):"
+        echo "  1) auto         : 智能匹配 (本地盘足够走 local_nvme 免挂云盘；超大外挂表模型选 nvme_engram 扩容)"
+        echo "  2) nvme_engram  : 反向跨盘扩容 — 外挂查表并发直落本地 NVMe + 主权重直落 Google Drive 全进内存 (推理零网盘 I/O)"
+        echo "  3) drive_engram : 正向跨盘扩容 — 主权重并发直落本地 NVMe + 外挂查表直落 Google Drive 软链读取"
+        echo "  4) drive_full   : 全量云盘扩容 — 所有权重与表直接落盘并读取于 Google Drive 目录"
+        echo "  5) local_nvme   : 纯本地高速盘 — 不挂载 Google Drive，并发高速直连 Hugging Face (常规模型首选)"
         read -r -p "选择编号 [1-5]: " s_idx
         case "$s_idx" in
           1) STORAGE_MODE="auto" ;;
@@ -623,20 +628,25 @@ page_settings() {
         ;;
       4)
         echo ""
-        read -r -p "启动时是否先在 Google Drive 查找已有分片并拉取至本地 NVMe? [Y/n]: " pf
-        if [[ "${pf:-Y}" =~ ^[Nn]$ ]]; then DRIVE_PREFETCH="0"; else DRIVE_PREFETCH="1"; fi
+        read -r -p "Hugging Face 本地并发分片下载线程数 (1-16) [当前: ${HF_DOWNLOAD_CONCURRENCY}]: " hfc
+        if [[ -n "$hfc" ]]; then
+          if [[ "$hfc" =~ ^[0-9]+$ && "$hfc" -ge 1 && "$hfc" -le 16 ]]; then
+            HF_DOWNLOAD_CONCURRENCY="$hfc"
+          else
+            echo "${C_RED}[忽略] 并发线程数需为 1-16。${C_RESET}"
+            sleep 1
+          fi
+        fi
         echo ""
-        echo "当云盘缺失分片并触发公网回退下载后，是否将新分片持久化回存云盘?"
-        echo "  1) both         : 主权重与外挂查表均同步回存云盘 (下次全免公网下载)"
-        echo "  2) weights_only : 仅将主权重存云盘，外挂查表仅在本地临时使用"
-        echo "  3) engram_only  : 仅将外挂查表分片回存云盘"
-        echo "  4) none         : 不向云盘写入任何新下载分片 (云盘仅作只读缓存源或完全不写，Free 号推荐)"
-        read -r -p "选择回存策略 [1-4，回车保持 ${DRIVE_SAVE_POLICY}]: " sp_idx
-        case "$sp_idx" in
-          1) DRIVE_SAVE_POLICY="both" ;;
-          2) DRIVE_SAVE_POLICY="weights_only" ;;
-          3) DRIVE_SAVE_POLICY="engram_only" ;;
-          4) DRIVE_SAVE_POLICY="none" ;;
+        echo "需要 Google Drive 扩容时，文件直接写入云盘的传输通道:"
+        echo "  1) auto       : 智能双通道 (有远端 colab auth 优先走 Drive REST API 0 本地缓存流式直传，否则自动回退 FUSE 直写 + 本地水位背压)"
+        echo "  2) api_stream : 强制 Drive REST API v3 流式直传 (0 本地写缓存、HTTP 200 真落盘，启动扩容时自动触发 colab auth)"
+        echo "  3) fuse       : 纯 FUSE 直落 (/content/drive 顺序直写 + 本地根盘水位背压与退出刷盘，无需 colab auth)"
+        read -r -p "选择云盘直落通道 [1-3，回车保持 ${DRIVE_WRITE_MODE}]: " dw_idx
+        case "$dw_idx" in
+          1) DRIVE_WRITE_MODE="auto" ;;
+          2) DRIVE_WRITE_MODE="api_stream" ;;
+          3) DRIVE_WRITE_MODE="fuse" ;;
         esac
         save_config
         ;;
@@ -645,9 +655,9 @@ page_settings() {
         ;;
       6)
         echo ""
-        read -r -p "本地 NVMe 或自定义高速盘路径 [当前: ${CUSTOM_MODELS_DIR}]: " v1
+        read -r -p "本地 NVMe 模型根目录 [当前: ${CUSTOM_MODELS_DIR}]: " v1
         CUSTOM_MODELS_DIR="${v1:-$CUSTOM_MODELS_DIR}"
-        read -r -p "Google Drive 分片缓存根路径 [当前: ${DRIVE_CACHE_DIR}]: " v2
+        read -r -p "Google Drive 云盘扩容根目录 [当前: ${DRIVE_CACHE_DIR}]: " v2
         DRIVE_CACHE_DIR="${v2:-$DRIVE_CACHE_DIR}"
         save_config
         ;;
@@ -811,10 +821,10 @@ run_interactive_loop() {
 
   while true; do
     clear 2>/dev/null || true
-    local status_badge ep phase sync_st eff_eng
+    local status_badge ep phase dio_st eff_eng
     ep="$(resolve_current_endpoint)"
     phase="$(read_telemetry_field phase)"
-    sync_st="$(read_telemetry_field cache_sync_state)"
+    dio_st="$(read_telemetry_field drive_io_state)"
     eff_eng="$(resolve_effective_engine "$MODEL_PRESET")"
     if is_bg_running; then
       status_badge="${C_GREEN}● 运行中${C_RESET} (${phase:-正在连接远端...})"
@@ -830,9 +840,9 @@ run_interactive_loop() {
     echo "  实例状态   : ${status_badge}"
     echo "  引擎与模型 : ${C_CYAN}${eff_eng}${C_RESET} | ${C_BOLD}${MODEL_PRESET}${C_RESET}  |  GPU: ${C_BOLD}${GPU_TYPE}${C_RESET}$( [[ "$HIGH_MEM" == "1" ]] && echo " (High-RAM)" || echo " (Std-RAM)" )"
     if [[ "$eff_eng" == "strata" ]]; then
-      echo "  存储与参数 : ${C_BOLD}${STORAGE_MODE}${C_RESET} (预查云盘: $( [[ "$DRIVE_PREFETCH" == "1" ]] && echo "开" || echo "关" ) | 回存: ${DRIVE_SAVE_POLICY} | KV: ${STRATA_KV_FORMAT} | 并发: ${STRATA_PARALLEL})"
+      echo "  存储与参数 : ${C_BOLD}${STORAGE_MODE}${C_RESET} (HF并发: ${HF_DOWNLOAD_CONCURRENCY}x | 云盘写: ${DRIVE_WRITE_MODE} | KV: ${STRATA_KV_FORMAT} | 并发: ${STRATA_PARALLEL})"
     else
-      echo "  存储拓扑   : ${C_BOLD}${STORAGE_MODE}${C_RESET} (预查云盘: $( [[ "$DRIVE_PREFETCH" == "1" ]] && echo "开" || echo "关" ) | 回存云盘: ${DRIVE_SAVE_POLICY} | 内存策略: ${EXPERT_RAM_POLICY})"
+      echo "  存储拓扑   : ${C_BOLD}${STORAGE_MODE}${C_RESET} (HF并发: ${HF_DOWNLOAD_CONCURRENCY}x | 云盘写: ${DRIVE_WRITE_MODE} | 内存策略: ${EXPERT_RAM_POLICY})"
     fi
     echo "  暴露隧道   : $(tunnel_desc "$TUNNEL_MODE")"
     if [[ -n "$ep" ]]; then
@@ -840,8 +850,8 @@ run_interactive_loop() {
     fi
     echo "${C_CYAN}-------------------------------------------------------------------------${C_RESET}"
     echo "  1) 启动 / 重启 Colab 实例与大模型隧道服务"
-    echo "  2) 状态监控页 (硬件/驱动/引擎状态、云盘同步、API 探测、colab usage 余额)"
-    echo "  3) 实时查看远端分片拉取、引擎初始化与推理日志 (Ctrl+C 返回菜单)"
+    echo "  2) 状态监控页 (硬件/驱动/引擎状态、云盘直落、API 探测、colab usage 余额)"
+    echo "  3) 实时查看远端下载、引擎初始化与推理日志 (Ctrl+C 返回菜单)"
     echo "  4) 一键发送流式对话测试请求 (curl /v1/chat/completions)"
     echo "  5) 设置页 (切换引擎与分级模型 / 自定义 HF / 存储拓扑 / 隧道，自动保存)"
     echo "  6) Colab 账号管理与授权中心 (登录去重 / 秒切 / 权限补齐 / 安全移除 / 全局释放)"
@@ -862,10 +872,10 @@ run_interactive_loop() {
         read -r -p "按回车返回主菜单..." _
         ;;
       0|q|Q)
-        if [[ "$sync_st" == "syncing" ]]; then
+        if [[ "$dio_st" == "streaming_api" || "$dio_st" == "writing_fuse" || "$dio_st" == "flushing" ]]; then
           echo ""
-          echo "${C_YELLOW}[注意] 后台正在将新下载的分片回存至 Google Drive ($(read_telemetry_field cache_sync_detail))。${C_RESET}"
-          read -r -p "按回车立即中止同步并销毁实例，或输入 c 取消退出等待同步完成: " quit_confirm
+          echo "${C_YELLOW}[注意] 远端正在向 Google Drive 直落写入或刷盘 ($(read_telemetry_field drive_io_detail))。${C_RESET}"
+          read -r -p "按回车立即中止写入并销毁实例，或输入 c 取消退出等待写入完成: " quit_confirm
           if [[ "${quit_confirm:-}" =~ ^[Cc]$ ]]; then
             continue
           fi

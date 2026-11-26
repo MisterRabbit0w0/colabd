@@ -83,8 +83,8 @@ reset_defaults() {
   MAYA_ABLATE_DEFAULT="off"                    # on | off (patch --ablate-default in maya-*.json)
 
   STORAGE_MODE="auto"                          # auto | nvme_engram | drive_engram | drive_full | local_nvme
-  DRIVE_PREFETCH="1"                           # 1: search Google Drive shards first and pull to NVMe
-  DRIVE_SAVE_POLICY="both"                     # both | weights_only | engram_only | none
+  HF_DOWNLOAD_CONCURRENCY="8"                  # 1..16 concurrent HTTP Range workers for local NVMe HF downloads
+  DRIVE_WRITE_MODE="auto"                      # auto | api_stream | fuse (Direct-to-Drive write transport)
   EXPERT_RAM_POLICY="auto"                     # auto | force_ram | allow_disk
 
   CUSTOM_MODELS_DIR="/content/maya-models"
@@ -129,8 +129,8 @@ save_config() {
       printf 'MAYA_ABLATION=%q\n' "$MAYA_ABLATION"
       printf 'MAYA_ABLATE_DEFAULT=%q\n' "$MAYA_ABLATE_DEFAULT"
       printf 'STORAGE_MODE=%q\n' "$STORAGE_MODE"
-      printf 'DRIVE_PREFETCH=%q\n' "$DRIVE_PREFETCH"
-      printf 'DRIVE_SAVE_POLICY=%q\n' "$DRIVE_SAVE_POLICY"
+      printf 'HF_DOWNLOAD_CONCURRENCY=%q\n' "$HF_DOWNLOAD_CONCURRENCY"
+      printf 'DRIVE_WRITE_MODE=%q\n' "$DRIVE_WRITE_MODE"
       printf 'EXPERT_RAM_POLICY=%q\n' "$EXPERT_RAM_POLICY"
       printf 'CUSTOM_MODELS_DIR=%q\n' "$CUSTOM_MODELS_DIR"
       printf 'DRIVE_CACHE_DIR=%q\n' "$DRIVE_CACHE_DIR"
@@ -165,6 +165,13 @@ load_config() {
       drive_hybrid) STORAGE_MODE="nvme_engram" ;;
       custom_ssd)   STORAGE_MODE="local_nvme" ;;
     esac
+    case "${DRIVE_WRITE_MODE:-auto}" in
+      auto|api_stream|fuse) ;;
+      *) DRIVE_WRITE_MODE="auto" ;;
+    esac
+    if [[ ! "${HF_DOWNLOAD_CONCURRENCY:-8}" =~ ^[0-9]+$ || "${HF_DOWNLOAD_CONCURRENCY:-8}" -lt 1 || "${HF_DOWNLOAD_CONCURRENCY:-8}" -gt 16 ]]; then
+      HF_DOWNLOAD_CONCURRENCY="8"
+    fi
   else
     save_config
   fi
@@ -233,6 +240,31 @@ colab_cli_for() {
     fi
   fi
 
+  # Work around google-colab-cli v0.8.0's broken `colab auth` stdin_hook (dumps raw input_request dict & hangs)
+  # by dispatching `colab_cli auth` through lib/colab_vm_auth.py whenever colab_cli is importable beside colab_bin.
+  if [[ "${1:-}" == "auth" && "${COLABD_USE_NATIVE_COLAB_AUTH:-0}" != "1" && -f "${COLABD_LIB_DIR}/colab_vm_auth.py" ]]; then
+    local vm_auth_py=""
+    local colab_dir=""
+    colab_dir="$(dirname "$colab_bin")"
+    if [[ -x "${colab_dir}/python" ]] && "${colab_dir}/python" -c "import colab_cli" >/dev/null 2>&1; then
+      vm_auth_py="${colab_dir}/python"
+    elif [[ -x "${colab_dir}/python3" ]] && "${colab_dir}/python3" -c "import colab_cli" >/dev/null 2>&1; then
+      vm_auth_py="${colab_dir}/python3"
+    fi
+    if [[ -n "$vm_auth_py" ]]; then
+      shift
+      local vm_args=(auth --auth "$auth_mode")
+      [[ -n "$sess_cfg" ]] && vm_args+=(--config "$sess_cfg")
+      vm_args+=("$@")
+      if [[ -n "$adc_override" ]]; then
+        GOOGLE_APPLICATION_CREDENTIALS="$adc_override" "$vm_auth_py" "${COLABD_LIB_DIR}/colab_vm_auth.py" "${vm_args[@]}"
+      else
+        "$vm_auth_py" "${COLABD_LIB_DIR}/colab_vm_auth.py" "${vm_args[@]}"
+      fi
+      return $?
+    fi
+  fi
+
   if [[ -n "$adc_override" && -n "$sess_cfg" ]]; then
     GOOGLE_APPLICATION_CREDENTIALS="$adc_override" "$colab_bin" --config "$sess_cfg" --auth "$auth_mode" "$@"
   elif [[ -n "$adc_override" ]]; then
@@ -246,6 +278,45 @@ colab_cli_for() {
 
 colab_cli() {
   colab_cli_for "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$@"
+}
+
+colab_vm_drive_auth_ready() {
+  local sess="$1"
+  local colab_bin=""
+  colab_bin="$(resolve_colab_bin 2>/dev/null || true)"
+  [[ -z "$colab_bin" || ! -f "${COLABD_LIB_DIR}/colab_vm_auth.py" ]] && return 1
+
+  local vm_auth_py=""
+  local colab_dir=""
+  colab_dir="$(dirname "$colab_bin")"
+  if [[ -x "${colab_dir}/python" ]] && "${colab_dir}/python" -c "import colab_cli" >/dev/null 2>&1; then
+    vm_auth_py="${colab_dir}/python"
+  elif [[ -x "${colab_dir}/python3" ]] && "${colab_dir}/python3" -c "import colab_cli" >/dev/null 2>&1; then
+    vm_auth_py="${colab_dir}/python3"
+  else
+    return 1
+  fi
+
+  local sess_cfg=""
+  if [[ -n "$ACTIVE_ACCOUNT" ]]; then
+    sess_cfg="$(colab_session_config_path "$ACTIVE_ACCOUNT")"
+  elif [[ "$COLAB_CLI_CONFIG_DIR" != "$HOME/.config/colab-cli" ]]; then
+    sess_cfg="${COLAB_CLI_CONFIG_DIR}/sessions.json"
+  fi
+
+  local adc_override=""
+  if [[ "$COLAB_AUTH_MODE" == "adc" && -n "$ACTIVE_ACCOUNT" ]]; then
+    adc_override="$(colab_adc_credentials_path "$ACTIVE_ACCOUNT" 2>/dev/null || true)"
+    [[ -z "$adc_override" ]] && return 1
+  fi
+
+  local vm_args=(check --auth "$COLAB_AUTH_MODE" -s "$sess")
+  [[ -n "$sess_cfg" ]] && vm_args+=(--config "$sess_cfg")
+  if [[ -n "$adc_override" ]]; then
+    GOOGLE_APPLICATION_CREDENTIALS="$adc_override" "$vm_auth_py" "${COLABD_LIB_DIR}/colab_vm_auth.py" "${vm_args[@]}" >/dev/null 2>&1
+  else
+    "$vm_auth_py" "${COLABD_LIB_DIR}/colab_vm_auth.py" "${vm_args[@]}" >/dev/null 2>&1
+  fi
 }
 
 format_account_label() {
@@ -406,22 +477,21 @@ maya_ablation_desc() {
 
 storage_desc() {
   case "$1" in
-    auto)         echo "自动匹配 (本地盘足够走 local_nvme，超大外挂表模型自动选反向跨盘 nvme_engram)" ;;
-    nvme_engram)  echo "反向跨盘推荐 (外挂查表拉取到本地 NVMe + 主权重云盘软链全进内存，推理零网盘 I/O)" ;;
-    drive_engram) echo "正向跨盘 (主权重放本地 NVMe + 外挂查表软链在云盘运行)" ;;
-    drive_full)   echo "全量云盘直连 (所有文件直接挂载于 ${DRIVE_CACHE_DIR})" ;;
-    local_nvme)   echo "纯本地高速盘 (${CUSTOM_MODELS_DIR}，仍可配合云盘拉取/回存)" ;;
+    auto)         echo "自动匹配 (本地盘够大走 local_nvme 免挂云盘；超容外挂表模型选 nvme_engram 扩容)" ;;
+    nvme_engram)  echo "反向跨盘扩容 (外挂查表直落本地 NVMe + 主权重直落 Google Drive 全进内存，推理零网盘 I/O)" ;;
+    drive_engram) echo "正向跨盘扩容 (主权重直落本地 NVMe + 外挂查表直落 Google Drive 软链读取)" ;;
+    drive_full)   echo "全量云盘扩容 (所有文件直接落盘并读取于 ${DRIVE_CACHE_DIR})" ;;
+    local_nvme)   echo "纯本地高速盘 (${CUSTOM_MODELS_DIR}，不挂载云盘，并发高速直连 Hugging Face)" ;;
     *)            echo "$1" ;;
   esac
 }
 
-save_policy_desc() {
-  case "$1" in
-    both)         echo "主权重与外挂查表新下载分片均回存云盘" ;;
-    weights_only) echo "仅主权重存云盘 (外挂查表仅在本地临时使用)" ;;
-    engram_only)  echo "仅外挂查表分片回存云盘" ;;
-    none)         echo "不向云盘写入任何新分片 (仅只读查找或纯本地)" ;;
-    *)            echo "$1" ;;
+drive_write_mode_desc() {
+  case "${1:-$DRIVE_WRITE_MODE}" in
+    auto)       echo "智能双通道 (有 colab auth 优先 Drive API 流式直传 0 本地缓存，否则 FUSE 直写 + 水位背压)" ;;
+    api_stream) echo "强制 Drive REST API v3 流式直传 (0 本地写缓存、HTTP 200 真落盘，需远端 colab auth)" ;;
+    fuse)       echo "纯 FUSE 直落 (/content/drive 顺序直写 + 本地根盘水位背压，无需 colab auth)" ;;
+    *)          echo "$1" ;;
   esac
 }
 

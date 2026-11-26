@@ -433,6 +433,10 @@ PRESETS: List[Dict[str, Any]] = [
             "model_arg": "DeepSeek-V4.1-Flash-1017",
             "ds4_quant": "abliterated-128g",
             "family": "ds4",
+            "drive_direct_hf": {
+                "hf_repo": "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF",
+                "hf_subdir": "Mix-128G",
+            },
         },
     },
     {
@@ -444,7 +448,7 @@ PRESETS: List[Dict[str, Any]] = [
         "recommended_gpu": "G4",
         "recommended_high_mem": True,
         "recommended_context": 65536,
-        "recommended_storage": "drive_full",
+        "recommended_storage": "auto",
         "disk_gb": 405,
         "mem_gb": 256,
         "has_engram": True,
@@ -456,6 +460,10 @@ PRESETS: List[Dict[str, Any]] = [
             "model_arg": "DeepSeek-V4.1-Flash-1017",
             "ds4_quant": "abliterated-256g",
             "family": "ds4",
+            "drive_direct_hf": {
+                "hf_repo": "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF",
+                "hf_subdir": "Mix-256G",
+            },
         },
     },
     {
@@ -733,7 +741,7 @@ PRESETS: List[Dict[str, Any]] = [
         "engine": "strata",
         "tier": "custom",
         "title": "Strata 自定义 Hugging Face 仓库 / 文件",
-        "desc": "自定义 HF Repo + .strata/.gguf 文件名 (或 Strata 家族/量化), 自动云盘预拉取与回存",
+        "desc": "自定义 HF Repo + .strata/.gguf 文件名 (或 Strata 家族/量化)，并发直落目标盘",
         "recommended_gpu": "T4",
         "recommended_high_mem": False,
         "recommended_context": 32768,

@@ -62,23 +62,25 @@ if grep -q 'rt-purge' "${SANDBOX}/purge_kr.json"; then
   exit 1
 fi
 
-echo "[3/9] Testing Google Drive shard prefetch, NVMe routing, fallback sync-back, and mmap patching..."
+echo "[3/9] Testing direct-to-target storage, multi-threaded Range HF download, Drive API streaming, FUSE backpressure, and mmap patching..."
 mkdir -p "${SANDBOX}/tmp" "${SANDBOX}/cfg" "${SANDBOX}/work/maya-models" \
-  "${SANDBOX}/drive/maya-models/Engram-Q6_K" \
   "${SANDBOX}/drive/maya-models/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-128G"
-
-dd if=/dev/urandom of="${SANDBOX}/drive/maya-models/Engram-Q6_K/engram-00001.gguf" bs=1024 count=32 2>/dev/null
-dd if=/dev/urandom of="${SANDBOX}/drive/maya-models/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-128G/model-00001.gguf" bs=1024 count=32 2>/dev/null
 
 python3 - "$ROOT_DIR" "$SANDBOX" <<'PYTEST'
 import collections
+import hashlib
+import http.server
 import json
 import os
 import pathlib
 import py_compile
+import re
 import shutil
+import socketserver
 import subprocess
 import sys
+import threading
+import urllib.parse
 
 root = pathlib.Path(sys.argv[1])
 box = pathlib.Path(sys.argv[2])
@@ -95,8 +97,8 @@ source "{root}/lib/lifecycle.sh"
 load_config
 CUSTOM_MODELS_DIR="{box}/work/maya-models"
 DRIVE_CACHE_DIR="{box}/drive/maya-models"
-DRIVE_PREFETCH="1"
-DRIVE_SAVE_POLICY="both"
+HF_DOWNLOAD_CONCURRENCY="4"
+DRIVE_WRITE_MODE="auto"
 EXPERT_RAM_POLICY="force_ram"
 build_remote_runner "nvme_engram"
 echo "$RUNNER_PY"
@@ -104,53 +106,326 @@ echo "$RUNNER_PY"
 runner_py = subprocess.check_output(["bash", "-c", cmd], text=True).strip().splitlines()[-1]
 py_compile.compile(runner_py, doraise=True)
 
-os.environ["MAYA_WORK_ROOT"] = str(box / "work")
-os.environ["MAYA_DRIVE_MOUNT_ROOT"] = str(box / "drive")
-os.environ["MAYA_SKIP_APT"] = "1"
+# Deterministic payloads for mock HF + mock Google Drive API v3
+PAYLOAD_LOCAL = (b"ENGRAM_RANGE_BLOCK_" * 140000)[: 2 * 1024 * 1024 + 131072]  # 2.125 MiB
+PAYLOAD_DRIVE_API = (b"DRIVE_API_STREAM_" * 90000)[: 1280 * 1024]  # 1.25 MiB (spans 3 x 512 KiB chunks)
+PAYLOAD_DRIVE_FUSE = (b"DRIVE_FUSE_DIRECT_" * 40000)[: 512 * 1024]  # 512 KiB
 
-ns = {"__name__": "unit_test"}
-exec(compile(pathlib.Path(runner_py).read_text(), runner_py, "exec"), ns)
+HF_FILES = {
+    "testorg/local-repo/engram-test.gguf": PAYLOAD_LOCAL,
+    "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-128G/model-00001.gguf": PAYLOAD_DRIVE_API,
+    "testorg/fuse-repo/fuse-direct.gguf": PAYLOAD_DRIVE_FUSE,
+}
 
-models_dir, ram_res = ns["prepare_storage_and_deps"]()
-assert ram_res is True
+drive_root_dir = box / "drive"
+mock_state = {
+    "range_hits": 0,
+    "drive_folders": {"root": drive_root_dir},
+    "drive_files": {},
+    "drive_sessions": {},
+    "drive_put_308": 0,
+    "drive_put_200": 0,
+    "next_id": 1,
+    "lock": threading.Lock(),
+}
 
-local_engram = models_dir / "Engram-Q6_K"
-assert not local_engram.is_symlink()
-assert (local_engram / "engram-00001.gguf").exists()
 
-ablit_link = models_dir / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Engram-Q6_K"
-assert ablit_link.is_symlink() and ablit_link.resolve() == local_engram.resolve()
+class MockHTTPHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
 
-mix_link = models_dir / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Mix-128G"
-assert mix_link.is_symlink()
+    def _send_json(self, code, obj, extra_headers=None):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
 
-(local_engram / "engram-00002.gguf").write_bytes(b"fallback_shard" * 512)
-ns["sync_new_shards_to_drive"](models_dir)
-synced_shard = box / "drive" / "maya-models" / "Engram-Q6_K" / "engram-00002.gguf"
-assert synced_shard.exists() and synced_shard.stat().st_size == (local_engram / "engram-00002.gguf").stat().st_size
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
 
-maya_dir = box / "work" / "project-maya"
-maya_dir.mkdir(parents=True, exist_ok=True)
-cfg_file = maya_dir / "maya-ds4.json"
-cfg_file.write_text(json.dumps({"args": ["--max-context", "65536"]}))
-ns["patch_existing_maya_configs"](maya_dir, True)
-assert json.loads(cfg_file.read_text())["args"][-2:] == ["--mmap-experts", "off"]
+        # Mock HF model file listing
+        if path == "/api/models/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF":
+            self._send_json(
+                200,
+                {
+                    "siblings": [
+                        {"rfilename": "Mix-128G/model-00001.gguf"},
+                        {"rfilename": "README.md"},
+                    ]
+                },
+            )
+            return
 
-# Verify nvme_engram aborts cleanly (exit 2) if Drive mount is missing and local disk < 280 GiB
-ns["DRIVE_MOUNT_ROOT"] = box / "missing_drive_mount"
-DiskUsage = collections.namedtuple("usage", ["total", "used", "free"])
-orig_du = shutil.disk_usage
-shutil.disk_usage = lambda _p: DiskUsage(250 * 1024**3, 50 * 1024**3, 200 * 1024**3)
+        # Mock HF file download with full Range support
+        m_hf = re.match(r"^/([^/]+/[^/]+)/resolve/main/(.+)$", path)
+        if m_hf:
+            repo = m_hf.group(1)
+            rel = urllib.parse.unquote(m_hf.group(2))
+            key = f"{repo}/{rel}"
+            if key not in HF_FILES:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = HF_FILES[key]
+            total = len(data)
+            rng = self.headers.get("Range")
+            if rng and rng.startswith("bytes="):
+                spec = rng[len("bytes=") :]
+                s_str, e_str = spec.split("-", 1)
+                start = int(s_str) if s_str else 0
+                end = int(e_str) if e_str else total - 1
+                end = min(end, total - 1)
+                chunk = data[start : end + 1]
+                if not (start == 0 and end == 0):
+                    with mock_state["lock"]:
+                        mock_state["range_hits"] += 1
+                self.send_response(206)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                self.wfile.write(chunk)
+                return
+            self.send_response(200)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(total))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        # Mock Drive API v3 list/search
+        if path == "/drive/v3/files":
+            qs = urllib.parse.parse_qs(parsed.query)
+            q = (qs.get("q") or [""])[0]
+            m_name = re.search(r"name='([^']+)'", q)
+            m_par = re.search(r"'([^']+)' in parents", q)
+            is_folder = "application/vnd.google-apps.folder" in q
+            name = m_name.group(1) if m_name else ""
+            par = m_par.group(1) if m_par else "root"
+            with mock_state["lock"]:
+                if is_folder:
+                    found = []
+                    for fid, fpath in mock_state["drive_folders"].items():
+                        if fid != "root" and fpath.name == name and fpath.parent == mock_state["drive_folders"].get(par):
+                            found.append({"id": fid, "name": name})
+                    self._send_json(200, {"files": found})
+                else:
+                    found = []
+                    for fid, finfo in mock_state["drive_files"].items():
+                        if finfo["parent"] == par and finfo["name"] == name:
+                            found.append({"id": fid, "name": name, "size": str(finfo["size"])})
+                    self._send_json(200, {"files": found})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        cl = int(self.headers.get("Content-Length") or "0")
+        body = json.loads(self.rfile.read(cl).decode("utf-8")) if cl > 0 else {}
+
+        if parsed.path == "/drive/v3/files":
+            parent_id = (body.get("parents") or ["root"])[0]
+            name = body["name"]
+            with mock_state["lock"]:
+                fid = f"folder-{mock_state['next_id']}"
+                mock_state["next_id"] += 1
+                fdir = mock_state["drive_folders"][parent_id] / name
+                fdir.mkdir(parents=True, exist_ok=True)
+                mock_state["drive_folders"][fid] = fdir
+            self._send_json(200, {"id": fid, "name": name})
+            return
+
+        if parsed.path == "/upload/drive/v3/files":
+            parent_id = (body.get("parents") or ["root"])[0]
+            name = body["name"]
+            with mock_state["lock"]:
+                sid = f"sess-{mock_state['next_id']}"
+                mock_state["next_id"] += 1
+                mock_state["drive_sessions"][sid] = {
+                    "parent": parent_id,
+                    "name": name,
+                    "buf": bytearray(),
+                }
+            host, port = self.server.server_address
+            self.send_response(200)
+            self.send_header("Location", f"http://{host}:{port}/upload/session/{sid}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self):
+        parsed = urllib.parse.urlparse(self.path)
+        m_sess = re.match(r"^/upload/session/([^/]+)$", parsed.path)
+        if not m_sess:
+            self.send_response(404)
+            self.end_headers()
+            return
+        sid = m_sess.group(1)
+        cl = int(self.headers.get("Content-Length") or "0")
+        chunk = self.rfile.read(cl) if cl > 0 else b""
+        cr = self.headers.get("Content-Range", "")
+        m_cr = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)", cr)
+        assert m_cr, f"Unexpected Content-Range: {cr}"
+        start, end, total_s = int(m_cr.group(1)), int(m_cr.group(2)), m_cr.group(3)
+        total = int(total_s) if total_s.isdigit() else None
+
+        with mock_state["lock"]:
+            sess = mock_state["drive_sessions"][sid]
+            assert start == len(sess["buf"]), f"Offset mismatch {start} != {len(sess['buf'])}"
+            sess["buf"].extend(chunk)
+            if total is not None and len(sess["buf"]) < total:
+                mock_state["drive_put_308"] += 1
+                self.send_response(308)
+                self.send_header("Range", f"bytes=0-{end}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            fid = f"file-{mock_state['next_id']}"
+            mock_state["next_id"] += 1
+            dst_fp = mock_state["drive_folders"][sess["parent"]] / sess["name"]
+            dst_fp.parent.mkdir(parents=True, exist_ok=True)
+            dst_fp.write_bytes(bytes(sess["buf"]))
+            mock_state["drive_files"][fid] = {
+                "parent": sess["parent"],
+                "name": sess["name"],
+                "size": len(sess["buf"]),
+            }
+            mock_state["drive_put_200"] += 1
+            size_out = str(len(sess["buf"]))
+        self._send_json(200, {"id": fid, "name": sess["name"], "size": size_out})
+
+
+class ReusableThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+server = ReusableThreadingServer(("127.0.0.1", 0), MockHTTPHandler)
+srv_port = server.server_address[1]
+srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+srv_thread.start()
+
 try:
-    aborted_code = None
+    base_url = f"http://127.0.0.1:{srv_port}"
+    os.environ["MAYA_WORK_ROOT"] = str(box / "work")
+    os.environ["MAYA_DRIVE_MOUNT_ROOT"] = str(box / "drive")
+    os.environ["MAYA_SKIP_APT"] = "1"
+    os.environ["COLABD_HF_BASE_URL"] = base_url
+    os.environ["COLABD_DRIVE_API_BASE"] = f"{base_url}/drive/v3"
+    os.environ["COLABD_DRIVE_UPLOAD_BASE"] = f"{base_url}/upload/drive/v3"
+    os.environ["COLABD_MULTIPART_MIN_BYTES"] = str(1024 * 1024)
+    os.environ["COLABD_DRIVE_CHUNK_BYTES"] = str(512 * 1024)
+    os.environ["COLABD_DRIVE_ACCESS_TOKEN"] = "mock-drive-token"
+
+    ns = {"__name__": "unit_test"}
+    exec(compile(pathlib.Path(runner_py).read_text(), runner_py, "exec"), ns)
+
+    # Confirm legacy sync-back & prefetch functions are completely removed
+    assert "sync_new_shards_to_drive" not in ns
+    assert "prefetch_dir_from_drive" not in ns
+
+    models_dir, ram_res = ns["prepare_storage_and_deps"]()
+    assert ram_res is True
+
+    local_engram = models_dir / "Engram-Q6_K"
+    assert not local_engram.is_symlink()
+
+    ablit_link = models_dir / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Engram-Q6_K"
+    assert ablit_link.is_symlink() and ablit_link.resolve() == local_engram.resolve()
+
+    mix_link = models_dir / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Mix-128G"
+    assert mix_link.is_symlink()
+    assert ns["_is_on_drive_mount"](mix_link / "model-00001.gguf") is True
+    assert ns["_is_on_drive_mount"](local_engram / "engram-test.gguf") is False
+
+    # 3a. Multi-threaded HTTP Range download onto local NVMe
+    local_out = ns["download_hf_file"]("testorg/local-repo", "engram-test.gguf", local_engram / "engram-test.gguf")
+    assert local_out is not None and local_out.read_bytes() == PAYLOAD_LOCAL
+    assert mock_state["range_hits"] >= 4, f"Expected multi-threaded Range requests, got {mock_state['range_hits']}"
+    assert not (local_engram / "engram-test.gguf.part").exists()
+    assert not (local_engram / "engram-test.gguf.part.meta.json").exists()
+
+    # 3b. Drive REST API v3 zero-local-cache streaming upload through symlink + in-place reuse
+    cnt1 = ns["ensure_hf_subdir_files"](
+        "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF", "Mix-128G", mix_link
+    )
+    assert cnt1 == 1
+    assert mock_state["drive_put_308"] >= 2, f"Expected multi-chunk 308 responses, got {mock_state['drive_put_308']}"
+    assert mock_state["drive_put_200"] == 1
+    drive_written = box / "drive" / "maya-models" / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Mix-128G" / "model-00001.gguf"
+    assert hashlib.sha256(drive_written.read_bytes()).hexdigest() == hashlib.sha256(PAYLOAD_DRIVE_API).hexdigest()
+
+    # Second call MUST hit in-place Drive API check and trigger 0 additional uploads!
+    ns["ensure_hf_subdir_files"](
+        "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF", "Mix-128G", mix_link
+    )
+    assert mock_state["drive_put_200"] == 1, "Expected Drive API existing-file hit to skip re-upload!"
+
+    # 3c. Auto fallback to FUSE direct-write when no Drive API token + local disk watermark guard
+    os.environ.pop("COLABD_DRIVE_ACCESS_TOKEN", None)
+    ns["_get_drive_api_token"] = lambda: None
+    fuse_dst = mix_link / "fuse-direct.gguf"
+    fuse_out = ns["download_hf_file"]("testorg/fuse-repo", "fuse-direct.gguf", fuse_dst)
+    assert fuse_out is not None and fuse_out.read_bytes() == PAYLOAD_DRIVE_FUSE
+    assert ns["_wrote_via_fuse"] is True
+    assert not (mix_link / "fuse-direct.gguf.part").exists()
+
+    # Verify FUSE watermark guard checks LOCAL root disk (not Drive quota!) and aborts on critical low local disk
+    DiskUsage = collections.namedtuple("usage", ["total", "used", "free"])
+    orig_du = shutil.disk_usage
+    ns["FUSE_BACKPRESSURE_MAX_WAIT_SEC"] = 0.15
+    work_real = os.path.realpath(str(box / "work"))
+
+    def fake_disk_usage(p):
+        if os.path.realpath(str(p)).startswith(work_real):
+            return DiskUsage(250 * 1024**3, 248 * 1024**3, 2 * 1024**3)  # Local disk critically low: 2 GiB!
+        return DiskUsage(2000 * 1024**3, 100 * 1024**3, 1900 * 1024**3)  # Drive quota huge: 1900 GiB!
+
+    shutil.disk_usage = fake_disk_usage
     try:
-        ns["prepare_storage_and_deps"]()
-    except SystemExit as exc:
-        aborted_code = exc.code
-    assert aborted_code == 2, f"Expected nvme_engram missing-Drive guard exit(2), got {aborted_code}"
+        hit_guard = False
+        try:
+            ns["download_hf_file"]("testorg/fuse-repo", "fuse-direct.gguf", mix_link / "fuse-blocked.gguf")
+        except RuntimeError as exc:
+            if "临界水位" in str(exc):
+                hit_guard = True
+        assert hit_guard, "Expected FUSE local-disk watermark guard to abort instead of trusting Drive quota!"
+    finally:
+        shutil.disk_usage = orig_du
+
+    # 3d. Maya config patching + nvme_engram missing-Drive guard
+    maya_dir = box / "work" / "project-maya"
+    maya_dir.mkdir(parents=True, exist_ok=True)
+    cfg_file = maya_dir / "maya-ds4.json"
+    cfg_file.write_text(json.dumps({"args": ["--max-context", "65536"]}))
+    ns["patch_existing_maya_configs"](maya_dir, True)
+    assert json.loads(cfg_file.read_text())["args"][-2:] == ["--mmap-experts", "off"]
+
+    ns["DRIVE_MOUNT_ROOT"] = box / "missing_drive_mount"
+    shutil.disk_usage = lambda _p: DiskUsage(250 * 1024**3, 50 * 1024**3, 200 * 1024**3)
+    try:
+        aborted_code = None
+        try:
+            ns["prepare_storage_and_deps"]()
+        except SystemExit as exc:
+            aborted_code = exc.code
+        assert aborted_code == 2, f"Expected nvme_engram missing-Drive guard exit(2), got {aborted_code}"
+    finally:
+        shutil.disk_usage = orig_du
 finally:
-    shutil.disk_usage = orig_du
+    server.shutdown()
+    server.server_close()
 PYTEST
+python3 "${ROOT_DIR}/tests/test_vm_auth.py" >/dev/null
 
 echo "[4/9] Testing account_store.py identity deduplication, scope parser, 0600 perms, and revocation..."
 python3 - "$ROOT_DIR" "$SANDBOX" <<'PYSTORE'
@@ -873,8 +1148,9 @@ PYCHK
 echo "[7/9] Testing interactive TUI settings and exit auto-stop..."
 REPAIR_DIR="$(python3 "${ROOT_DIR}/lib/account_store.py" path "${XDG_CONFIG_HOME}/colabd/accounts" "repair@example.com")"
 PATH="${MULTI_BOX}/mockbin:$PATH" colab --config "${REPAIR_DIR}/sessions.json" --auth oauth2 new -s colabd-llm --gpu G4 >/dev/null
-printf '5\n4\nY\n2\n0\n0\n' | run_colabd >/dev/null 2>&1
-grep -q '^DRIVE_SAVE_POLICY=weights_only$' "${XDG_CONFIG_HOME}/colabd/config.env"
+printf '5\n4\n12\n2\n0\n0\n' | run_colabd >/dev/null 2>&1
+grep -q '^HF_DOWNLOAD_CONCURRENCY=12$' "${XDG_CONFIG_HOME}/colabd/config.env"
+grep -q '^DRIVE_WRITE_MODE=api_stream$' "${XDG_CONFIG_HOME}/colabd/config.env"
 grep -q 'STOPPED ident=repair@example.com mode=oauth2 session=colabd-llm ep=m-repair-colabd-llm' "$MOCK_CALL_LOG"
 
 echo "[8/9] Testing colabd managed isolated uv venv runtime (works with zero external colab on PATH)..."
@@ -1000,13 +1276,15 @@ ENG_BOX="${SANDBOX}/multi_engine"
 mkdir -p "${ENG_BOX}/cfg/colabd" "${ENG_BOX}/tmp" "${ENG_BOX}/work/maya-models" \
   "${ENG_BOX}/drive/maya-models/Inkling-2-Mini-Abliterated-Strata"
 
-# 9a. Legacy v0.1.0 config migration: config without ENGINE_TYPE preserves Maya + ds4-abliterated-128g
+# 9a. Legacy v0.1.0 config migration: drops DRIVE_PREFETCH/DRIVE_SAVE_POLICY cleanly & preserves Maya + ds4-abliterated-128g
 cat > "${ENG_BOX}/cfg/colabd/config.env" <<'LEGCFG'
 SESSION_NAME=legacy-sess
 GPU_TYPE=G4
 HIGH_MEM=1
 MODEL_PRESET=ds4-abliterated-128g
 STORAGE_MODE=drive_hybrid
+DRIVE_PREFETCH=1
+DRIVE_SAVE_POLICY=both
 LEGCFG
 
 XDG_CONFIG_HOME="${ENG_BOX}/cfg" bash --noprofile --norc -c "
@@ -1018,11 +1296,18 @@ XDG_CONFIG_HOME="${ENG_BOX}/cfg" bash --noprofile --norc -c "
   load_config
   [[ \"\$STORAGE_MODE\" == 'nvme_engram' ]]
   [[ \"\$ENGINE_TYPE\" == 'auto' ]]
+  [[ \"\$HF_DOWNLOAD_CONCURRENCY\" == '8' ]]
+  [[ \"\$DRIVE_WRITE_MODE\" == 'auto' ]]
   [[ \"\$(resolve_effective_engine)\" == 'maya' ]]
   [[ \"\$MAYA_ABLATION\" == 'on' ]]
   [[ \"\$MAYA_ABLATE_DEFAULT\" == 'off' ]]
+  save_config
   rm -rf \"\$STATE_DIR\"
 "
+if grep -q '^DRIVE_SAVE_POLICY=' "${ENG_BOX}/cfg/colabd/config.env"; then
+  echo "Legacy DRIVE_SAVE_POLICY should not be persisted after migration!" >&2
+  exit 1
+fi
 
 # 9b. CLI `colabd use` auto-applies Free T4 hardware profile and `--keep-hw` preserves it
 XDG_CONFIG_HOME="${ENG_BOX}/cfg" NO_COLOR=1 bash --noprofile --norc "${ROOT_DIR}/bin/colabd" \
@@ -1053,8 +1338,13 @@ root = pathlib.Path(sys.argv[1])
 box = pathlib.Path(sys.argv[2])
 reg_py = root / "lib" / "model_registry.py"
 
-# Registry checks: legacy alias, custom Strata HF, custom Maya
+# Registry checks: legacy alias, DS4 drive_direct_hf metadata, custom Strata HF, custom Maya
 assert subprocess.check_output([sys.executable, str(reg_py), "exists", "inkling-2-mini"], text=True).strip() == "maya-inkling-2-mini"
+
+ds4_128 = json.loads(subprocess.check_output([sys.executable, str(reg_py), "resolve", "ds4-abliterated-128g"], text=True))
+assert ds4_128["maya"]["drive_direct_hf"]["hf_subdir"] == "Mix-128G"
+ds4_256 = json.loads(subprocess.check_output([sys.executable, str(reg_py), "resolve", "ds4-abliterated-256g"], text=True))
+assert ds4_256["maya"]["drive_direct_hf"]["hf_subdir"] == "Mix-256G"
 
 custom_strata = json.loads(
     subprocess.check_output(
@@ -1121,22 +1411,24 @@ STRATA_PARALLEL="4"
 STRATA_BUILD_FALLBACK="auto"
 CUSTOM_MODELS_DIR="{box}/work/maya-models"
 DRIVE_CACHE_DIR="{box}/drive/maya-models"
-DRIVE_PREFETCH="1"
-DRIVE_SAVE_POLICY="both"
+HF_DOWNLOAD_CONCURRENCY="6"
+DRIVE_WRITE_MODE="auto"
 build_remote_runner "local_nvme"
 echo "$RUNNER_PY"
 """
 strata_runner = subprocess.check_output(["bash", "-c", strata_cmd], text=True).strip().splitlines()[-1]
 py_compile.compile(strata_runner, doraise=True)
 
+# local_nvme MUST work with ZERO Google Drive mount!
 os.environ["MAYA_WORK_ROOT"] = str(box / "work")
-os.environ["MAYA_DRIVE_MOUNT_ROOT"] = str(box / "drive")
+os.environ["MAYA_DRIVE_MOUNT_ROOT"] = str(box / "nonexistent_drive_mount")
 os.environ["MAYA_SKIP_APT"] = "1"
 
 ns = {"__name__": "unit_test_strata"}
 exec(compile(pathlib.Path(strata_runner).read_text(), strata_runner, "exec"), ns)
 
 assert ns["ENGINE_TYPE"] == "strata"
+assert ns["HF_DOWNLOAD_CONCURRENCY"] == 6
 assert ns["choose_strata_install_mode"]("580.65.06", "auto") == "prebuilt"
 assert ns["choose_strata_install_mode"]("575.51", "auto") == "prebuilt"
 assert ns["choose_strata_install_mode"]("550.54.15", "auto") == "source"
@@ -1150,15 +1442,17 @@ assert ns["check_health_response"](503, b"busy") == (False, "unreachable")
 
 models_dir, ram_res = ns["prepare_storage_and_deps"]()
 assert ram_res is False
+assert ns["TELEMETRY"]["drive_io_state"] == "disabled"
 local_strata = models_dir / "Inkling-2-Mini-Abliterated-Strata" / "Inkling-2-Mini-SQ-10-abliterated.strata"
-assert local_strata.exists()
+local_strata.parent.mkdir(parents=True, exist_ok=True)
+local_strata.write_bytes(b"strata_local_test" * 64)
 
-# Verify .strata sync-back to Drive works atomically
-new_vision = models_dir / "Inkling-2-Mini-Abliterated-Strata" / "Inkling-2-Mini-Vision.strata"
-new_vision.write_bytes(b"strata_vision_test" * 128)
-ns["sync_new_shards_to_drive"](models_dir)
-synced_vision = box / "drive" / "maya-models" / "Inkling-2-Mini-Abliterated-Strata" / "Inkling-2-Mini-Vision.strata"
-assert synced_vision.exists() and synced_vision.stat().st_size == new_vision.stat().st_size
+# Verify drive_full points models_dir directly to DRIVE_CACHE_DIR (eliminating Strata path mismatch)
+ns["STORAGE_MODE"] = "drive_full"
+ns["DRIVE_MOUNT_ROOT"] = box / "drive"
+df_dir, _ = ns["prepare_storage_and_deps"]()
+assert df_dir == box / "drive" / "maya-models"
+assert ns["TELEMETRY"]["drive_io_state"] == "ready"
 
 launch_cmd = ns["build_strata_launch_cmd"]("/content/strata-bin/strata", ns["MODEL_SPEC"]["strata"], models_dir / "strata-data", local_strata)
 assert "--family" in launch_cmd and launch_cmd[launch_cmd.index("--family") + 1] == "inkling-2-mini"

@@ -374,8 +374,10 @@ guard_release_before_account_change() {
     done < "$tmp_orphans"
   fi
 
-  if [[ "$checking_current" -eq 1 && "$(read_telemetry_field cache_sync_state)" == "syncing" ]]; then
-    echo "${C_YELLOW}[注意] 后台正在回存新下载的模型分片至 Google Drive ($(read_telemetry_field cache_sync_detail))。${C_RESET}"
+  local drive_io_st=""
+  drive_io_st="$(read_telemetry_field drive_io_state)"
+  if [[ "$checking_current" -eq 1 && ( "$drive_io_st" == "streaming_api" || "$drive_io_st" == "writing_fuse" || "$drive_io_st" == "flushing" ) ]]; then
+    echo "${C_YELLOW}[注意] 远端正在直写模型文件至 Google Drive ($(read_telemetry_field drive_io_detail))，立即释放将中断当前写入。${C_RESET}"
   fi
 
   local decision=""
@@ -835,6 +837,7 @@ cleanup_on_exit() {
 
 build_remote_runner() {
   local effective_storage="$1"
+  local effective_drive_write="${2:-$DRIVE_WRITE_MODE}"
   local host_py=""
   host_py="$(resolve_host_python 2>/dev/null || command -v python3)"
   local eff_engine=""
@@ -847,7 +850,7 @@ build_remote_runner() {
     "$MAYA_CONTEXT" "$MAYA_DRAFTING" "$MAYA_PORT" \
     "$STRATA_KV_FORMAT" "$STRATA_PARALLEL" "$STRATA_BUILD_FALLBACK" \
     "$MAYA_ABLATION" "$MAYA_ABLATE_DEFAULT" \
-    "$effective_storage" "$DRIVE_PREFETCH" "$DRIVE_SAVE_POLICY" "$EXPERT_RAM_POLICY" \
+    "$effective_storage" "$HF_DOWNLOAD_CONCURRENCY" "$effective_drive_write" "$EXPERT_RAM_POLICY" \
     "$CUSTOM_MODELS_DIR" "$DRIVE_CACHE_DIR" \
     "$TUNNEL_MODE" "$CF_TUNNEL_TOKEN" "$CF_PUBLIC_HOSTNAME" \
     "$HF_TOKEN" "$MAYA_API_KEY" "$NO_VISION" "$WEB_UI" "$LOCAL_BIND" \
@@ -860,7 +863,7 @@ keys = [
     "maya_context", "maya_drafting", "maya_port",
     "strata_kv_format", "strata_parallel", "strata_build_fallback",
     "maya_ablation", "maya_ablate_default",
-    "storage_mode", "drive_prefetch", "drive_save_policy", "expert_ram_policy",
+    "storage_mode", "hf_download_concurrency", "drive_write_mode", "expert_ram_policy",
     "custom_models_dir", "drive_cache_dir",
     "tunnel_mode", "cf_tunnel_token", "cf_public_hostname",
     "hf_token", "maya_api_key", "no_vision", "web_ui", "local_bind",
@@ -920,6 +923,17 @@ validate_runtime_settings() {
     echo "${C_RED}[配置错误] STRATA_PARALLEL '${STRATA_PARALLEL}' 无效（需为 1-64），请进设置页 [5] 修改。${C_RESET}"
     return 1
   fi
+  if [[ ! "${HF_DOWNLOAD_CONCURRENCY:-8}" =~ ^[0-9]+$ || "${HF_DOWNLOAD_CONCURRENCY:-8}" -lt 1 || "${HF_DOWNLOAD_CONCURRENCY:-8}" -gt 16 ]]; then
+    echo "${C_RED}[配置错误] HF_DOWNLOAD_CONCURRENCY '${HF_DOWNLOAD_CONCURRENCY}' 无效（需为 1-16），请进设置页 [4] 修改。${C_RESET}"
+    return 1
+  fi
+  case "${DRIVE_WRITE_MODE:-auto}" in
+    auto|api_stream|fuse) ;;
+    *)
+      echo "${C_RED}[配置错误] DRIVE_WRITE_MODE '${DRIVE_WRITE_MODE}' 无效（仅支持 auto | api_stream | fuse），请进设置页 [4] 修改。${C_RESET}"
+      return 1
+      ;;
+  esac
   if [[ "$MODEL_PRESET" == "strata-custom-hf" && -z "$CUSTOM_HF_REPO" && -z "$CUSTOM_HF_FILE" ]]; then
     echo "${C_RED}[配置错误] 当前为 Strata 自定义模型预设，但尚未填写 Hugging Face 仓库或官方目录量化名，请进设置页 [1] 配置。${C_RESET}"
     return 1
@@ -1047,9 +1061,14 @@ action_start_or_restart() {
     created_fresh_vm=1
   fi
 
+  local ran_gcp_auth=0
   if [[ "$AUTO_GCP_AUTH" == "1" ]]; then
-    echo "${C_CYAN}[GCP 授权] 正在向远端实例注入 GCP 服务凭证 (colab auth -s ${SESSION_NAME})...${C_RESET}"
-    colab_cli auth -s "$SESSION_NAME" || echo "${C_YELLOW}[警告] colab auth 未成功，继续后续流程。${C_RESET}"
+    echo "${C_CYAN}[GCP 授权] 正在向远端实例注入 GCP / Drive 服务凭证 (colab auth -s ${SESSION_NAME})...${C_RESET}"
+    if colab_cli auth -s "$SESSION_NAME"; then
+      ran_gcp_auth=1
+    else
+      echo "${C_YELLOW}[警告] colab auth 未成功，继续后续流程。${C_RESET}"
+    fi
   fi
 
   local effective_storage="$STORAGE_MODE"
@@ -1061,23 +1080,23 @@ action_start_or_restart() {
     local free_gb=""
     free_gb="$(probe_remote_local_free_gb "$SESSION_NAME")"
     if [[ -z "$free_gb" ]]; then
-      echo "${C_YELLOW}[警告] 远端磁盘容量探测超时或未返回数值，默认按 235 GiB 消费级 Colab 盘选择推荐跨盘方案。${C_RESET}"
+      echo "${C_YELLOW}[警告] 远端磁盘容量探测超时或未返回数值，默认按 235 GiB 消费级 Colab 盘选择推荐方案。${C_RESET}"
       if model_has_engram "$MODEL_PRESET"; then
         effective_storage="nvme_engram"
       else
         effective_storage="local_nvme"
       fi
     elif [[ "$free_gb" -ge "$total_needed" ]]; then
-      echo "${C_GREEN}[预检] 本地 /content 剩余约 ${free_gb} GiB (满足完整 ${total_needed} GiB)，选用纯本地高速盘模式 (local_nvme)。${C_RESET}"
+      echo "${C_GREEN}[预检] 本地 /content 剩余约 ${free_gb} GiB (满足完整 ${total_needed} GiB)，选用纯本地高速盘模式 (local_nvme，不挂载云盘)。${C_RESET}"
       effective_storage="local_nvme"
     elif model_has_engram "$MODEL_PRESET" && [[ "$free_gb" -ge 175 ]]; then
       echo ""
       echo "${C_YELLOW}[空间检测] 本地 /content 剩余约 ${free_gb} GiB (小于完整 ${total_needed} GiB，但足以存放外挂查表)。${C_RESET}"
-      echo "请选择本次跨盘与缓存运行方案:"
-      echo "  1) 【反向跨盘 nvme_engram】(推荐: 先去云盘找外挂表拉到本地 NVMe 跑，主权重挂云盘全载入内存，推理零网盘 I/O)"
-      echo "  2) 【正向跨盘 drive_engram】(主权重放本地 NVMe，外挂查表软链在云盘上按需读取)"
-      echo "  3) 【全量云盘 drive_full】  (所有文件均在 ${DRIVE_CACHE_DIR} 上读写)"
-      echo "  4) 改跑无需外挂表的本地直跑预设 (自动切至 local_nvme)"
+      echo "请选择本次跨盘扩容运行方案 (缺失文件将直接下载到对应目标盘，无后台回存):"
+      echo "  1) 【反向跨盘扩容 nvme_engram】(推荐: 外挂查表并发直落本地 NVMe，主权重直落 Google Drive 并全载入内存，推理零网盘 I/O)"
+      echo "  2) 【正向跨盘扩容 drive_engram】(主权重并发直落本地 NVMe，外挂查表直落 Google Drive 软链读取)"
+      echo "  3) 【全量云盘扩容 drive_full】  (所有文件直接落盘并读取于 ${DRIVE_CACHE_DIR})"
+      echo "  4) 改跑无需外挂表的本地直跑预设 (自动切至 local_nvme，不挂载云盘)"
       echo "  0) 取消启动并立即回收实例"
       read -r -p "请输入选项 [1]: " disk_choice
       disk_choice="${disk_choice:-1}"
@@ -1090,7 +1109,7 @@ action_start_or_restart() {
         *) effective_storage="nvme_engram" ;;
       esac
     else
-      echo "${C_YELLOW}[空间预警] 本地 /content 仅剩 ${free_gb} GiB，切换至全量云盘模式 (drive_full)。${C_RESET}"
+      echo "${C_YELLOW}[空间预警] 本地 /content 仅剩 ${free_gb} GiB，切换至全量云盘扩容模式 (drive_full)。${C_RESET}"
       effective_storage="drive_full"
     fi
   fi
@@ -1098,26 +1117,60 @@ action_start_or_restart() {
   local need_drive=0
   if [[ "$effective_storage" == "nvme_engram" || "$effective_storage" == "drive_engram" || "$effective_storage" == "drive_full" ]]; then
     need_drive=1
-  elif [[ "$DRIVE_PREFETCH" == "1" || "$DRIVE_SAVE_POLICY" != "none" ]]; then
-    need_drive=1
   fi
 
+  local effective_drive_write_mode="$DRIVE_WRITE_MODE"
   if [[ "$need_drive" -eq 1 ]]; then
-    echo "${C_CYAN}[挂载] 正在挂载 Google Drive 至远端 /content/drive (用于查找缓存分片与按策略回存)...${C_RESET}"
+    if [[ "$effective_drive_write_mode" == "api_stream" && "$ran_gcp_auth" -eq 0 ]]; then
+      echo "${C_CYAN}[Drive API 授权] 当前为强制流式直传模式 (api_stream)，正在校验/完成远端 Drive API 授权回调...${C_RESET}"
+      if colab_cli auth -s "$SESSION_NAME"; then
+        ran_gcp_auth=1
+      else
+        echo "${C_YELLOW}[警告] 远端 Drive API 授权未完成。${C_RESET}"
+        read -r -p "本次是否临时改走 FUSE 顺序直写 + 水位背压继续启动? [Y/n] (选 n 取消并回收新实例): " fb_yn
+        if [[ "${fb_yn:-Y}" =~ ^[Nn]$ ]]; then
+          if [[ "$created_fresh_vm" -eq 1 ]]; then
+            echo "${C_YELLOW}[自动回收] 正在立即释放刚分配的空闲 GPU 实例以防扣费...${C_RESET}"
+            stop_colab_instance || true
+          fi
+          read -r -p "按回车返回主菜单..." _
+          return
+        fi
+        effective_drive_write_mode="fuse"
+      fi
+    elif [[ "$effective_drive_write_mode" == "auto" && "$ran_gcp_auth" -eq 0 ]]; then
+      if colab_vm_drive_auth_ready "$SESSION_NAME"; then
+        ran_gcp_auth=1
+        echo "${C_GREEN}[Drive API] 远端实例已具备有效 Drive API 凭证，将自动启用 0 本地缓存流式直传。${C_RESET}"
+      else
+        echo ""
+        echo "${C_CYAN}[Drive API 授权] 当前为云盘扩容模式 (auto)，远端尚未完成 Google Drive API 授权。${C_RESET}"
+        read -r -p "是否立即完成一次性浏览器授权以启用【0 本地缓存流式直传】? [Y/n] (选 n 则改走 FUSE 直写 + 水位背压): " auto_auth_yn
+        if [[ ! "${auto_auth_yn:-Y}" =~ ^[Nn]$ ]]; then
+          if colab_cli auth -s "$SESSION_NAME"; then
+            ran_gcp_auth=1
+          else
+            echo "${C_YELLOW}[回退] 远端 Drive API 授权未完成，本次自动回退至 FUSE 顺序直写 + 本地水位背压。${C_RESET}"
+            effective_drive_write_mode="fuse"
+          fi
+        else
+          echo "${C_DIM}[提示] 已跳过 Drive API 授权，本次将走 FUSE 顺序直写 + 本地根盘水位背压。${C_RESET}"
+          effective_drive_write_mode="fuse"
+        fi
+      fi
+    fi
+    echo "${C_CYAN}[挂载] 正在挂载 Google Drive 至远端 /content/drive (用于跨盘扩容原地读取与直落写入)...${C_RESET}"
     colab_cli drivemount -s "$SESSION_NAME" || true
     # Real `colab drivemount` returns exit code 0 even when drive.mount() raises in the kernel; always verify!
     if ! verify_remote_drive_mounted "$SESSION_NAME"; then
-      if [[ "$effective_storage" == "local_nvme" ]]; then
-        echo "${C_YELLOW}[警告] Google Drive 未实际挂载 (/content/drive/MyDrive 不存在)，将在纯本地模式下走公网回退下载。${C_RESET}"
-      else
-        echo "${C_RED}[错误] 当前存储拓扑 (${effective_storage}) 依赖 Google Drive，但未检测到 /content/drive/MyDrive 挂载（若缺少 drive.file 权限请运行 colabd auth refresh）。${C_RESET}"
-        if [[ "$created_fresh_vm" -eq 1 ]]; then
-          echo "${C_YELLOW}[自动回收] 正在立即释放刚分配的空闲 GPU 实例以防扣费...${C_RESET}"
-          stop_colab_instance || true
-        fi
-        read -r -p "按回车返回主菜单..." _
-        return
+      echo "${C_RED}[错误] 当前扩容拓扑 (${effective_storage}) 依赖 Google Drive，但未检测到 /content/drive/MyDrive 挂载。${C_RESET}"
+      echo "${C_YELLOW}  说明: colab drivemount 使用独立的 dfs_ephemeral 浏览器授权流（与本地 drive.file scope 无关）；请确认已完成浏览器授权弹窗，且注意部分 ADC 账号不支持该凭证传播。${C_RESET}"
+      if [[ "$created_fresh_vm" -eq 1 ]]; then
+        echo "${C_YELLOW}[自动回收] 正在立即释放刚分配的空闲 GPU 实例以防扣费...${C_RESET}"
+        stop_colab_instance || true
       fi
+      read -r -p "按回车返回主菜单..." _
+      return
     fi
   fi
 
@@ -1173,7 +1226,7 @@ action_start_or_restart() {
     SSH_PID=$!
   fi
 
-  build_remote_runner "$effective_storage"
+  build_remote_runner "$effective_storage" "$effective_drive_write_mode"
   : > "$REMOTE_LOG"
   # Pass --timeout 0 because real `colab exec` defaults to 30s idle timeout!
   colab_cli exec --timeout 0 -s "$SESSION_NAME" -f "$RUNNER_PY" >>"$REMOTE_LOG" 2>&1 &
@@ -1181,7 +1234,7 @@ action_start_or_restart() {
 
   local reuse_tag=""
   [[ "$reused_vm" -eq 1 ]] && reuse_tag=" (复用实例并已重置内核)"
-  echo "${C_GREEN}[已启动] 后台守护进程已运行 (PID: ${EXEC_PID})${reuse_tag}，正在执行云盘分片检索与隧道初始化...${C_RESET}"
+  echo "${C_GREEN}[已启动] 后台守护进程已运行 (PID: ${EXEC_PID})${reuse_tag}，正在执行存储就绪、模型下载与隧道初始化...${C_RESET}"
   local waited=0
   while [[ $waited -lt 15 ]]; do
     local ep=""
