@@ -5,7 +5,7 @@
 # ==============================================================================
 
 page_account_auth() {
-  refresh_colab_auth_status 5 0 || true
+  refresh_colab_auth_status "" 0 || true
   while true; do
     clear 2>/dev/null || true
     local cli_ver="未安装"
@@ -42,7 +42,7 @@ page_account_auth() {
     case "${a_opt:-0}" in
       1)
         echo ""
-        if refresh_colab_auth_status 6 1; then
+        if refresh_colab_auth_status "" 1; then
           echo "${C_GREEN}[有效] 当前账号已正常登录: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")${C_RESET}"
           echo "${C_DIM}--- colab whoami ---${C_RESET}"
           colab_cli whoami 2>&1 | sed 's/^/  /' || true
@@ -54,6 +54,8 @@ page_account_auth() {
           echo "${C_RED}[权限域不足] ${AUTH_DETAIL}${C_RESET}"
           echo "${C_DIM}--- colab whoami ---${C_RESET}"
           colab_cli whoami 2>&1 | sed 's/^/  /' || true
+        elif [[ "$AUTH_STATE" == "timeout" ]]; then
+          echo "${C_YELLOW}[探测超时] ${AUTH_DETAIL}${C_RESET}"
         else
           echo "${C_YELLOW}[未授权] ${AUTH_DETAIL}${C_RESET}"
         fi
@@ -143,7 +145,7 @@ PYH
 }
 
 page_status() {
-  refresh_colab_auth_status 4 0 || true
+  refresh_colab_auth_status "" 0 || true
   while true; do
     clear 2>/dev/null || true
     local phase gpu drv_ver ram_gb local_free drive_free models_dir api_ok ep ram_res sync_st sync_msg eng_telem eff_eng
@@ -213,6 +215,8 @@ page_status() {
       colab_cli status -s "$target" 2>&1 | sed 's/^/  /' || echo "  (当前无活跃会话记录)"
       echo "${C_DIM}--- colab usage ---${C_RESET}"
       colab_cli usage 2>&1 | sed 's/^/  /' || echo "  (无法获取算力单元用量)"
+    elif [[ "$AUTH_STATE" == "timeout" ]]; then
+      echo "  (认证状态探测超时，本地凭证仍在；按 r 重试刷新，或检查网络/代理)"
     else
       echo "  (账号尚未登录或未安装 CLI，可按 a 进入多账号中心登录)"
     fi
@@ -220,7 +224,7 @@ page_status() {
     echo "操作: [r] 刷新  [t] 测试对话  [l] 实时日志  [g] 注入远端 GCP 授权  [a] 多账号中心  [回车/b] 返回"
     read -r -p "请选择: " sub
     case "${sub:-b}" in
-      r|R) refresh_colab_auth_status 4 1 || true; continue ;;
+      r|R) refresh_colab_auth_status "" 1 || true; continue ;;
       t|T) action_test_request ;;
       l|L) action_view_logs ;;
       g|G) do_remote_gcp_auth; read -r -p "按回车继续..." _ ;;
@@ -757,7 +761,7 @@ page_settings() {
                 AUTH_NOTE=""
                 COLAB_AUTH_MODE="oauth2"
                 save_config
-                refresh_colab_auth_status 4 0 || true
+                refresh_colab_auth_status "" 0 || true
               fi
             fi
             ;;
@@ -769,7 +773,7 @@ page_settings() {
                 AUTH_NOTE=""
                 COLAB_AUTH_MODE="adc"
                 save_config
-                refresh_colab_auth_status 4 0 || true
+                refresh_colab_auth_status "" 0 || true
               fi
             fi
             ;;
@@ -792,7 +796,7 @@ page_settings() {
           COLAB_AUTH_MODE="$keep_mode"
           AUTO_ADOPT_EXTERNAL="$keep_adopt"
           save_config
-          refresh_colab_auth_status 4 0 || true
+          refresh_colab_auth_status "" 0 || true
         fi
         ;;
       0|"")
@@ -803,7 +807,7 @@ page_settings() {
 }
 
 run_interactive_loop() {
-  refresh_colab_auth_status 4 0 || true
+  refresh_colab_auth_status "" 0 || true
 
   while true; do
     clear 2>/dev/null || true

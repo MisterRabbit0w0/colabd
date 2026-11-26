@@ -7,6 +7,11 @@
 # Compatible with Bash 3.2+ (macOS and Linux)
 # ==============================================================================
 
+# Default timeout (seconds) for non-interactive `colab` auth/session probes.
+# Must be generous enough for cold Python boot + OS keyring I/O + automatic
+# 1-hour OAuth 2.0 access_token refresh + Colab API roundtrip.
+COLABD_AUTH_PROBE_TIMEOUT="${COLABD_AUTH_PROBE_TIMEOUT:-15}"
+
 account_store() {
   local py_bin=""
   py_bin="$(resolve_host_python 2>/dev/null || true)"
@@ -110,7 +115,14 @@ except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGTERM)
     except Exception:
         pass
-    sys.stdout.write("等待浏览器登录授权\n")
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+    sys.stdout.write(f"探测超时 ({timeout_s}s，可能正在刷新 OAuth 令牌或网络较慢)\n")
     sys.exit(124)
 except Exception as exc:
     sys.stdout.write(f"{exc}\n")
@@ -122,18 +134,18 @@ PY
 probe_colab_identity_and_scopes() {
   local auth_mode="$1"
   local acct="$2"
-  local timeout_sec="${3:-6}"
+  local timeout_sec="${3:-$COLABD_AUTH_PROBE_TIMEOUT}"
   local adc_file_override="${4:-}"
 
   local out=""
+  local probe_rc=0
   if [[ -n "$adc_file_override" ]]; then
-    if ! out="$(COLABD_PROBE_ADC_FILE="$adc_file_override" probe_colab_command "$auth_mode" "$acct" "$timeout_sec" whoami 2>/dev/null)"; then
-      return 1
-    fi
+    out="$(COLABD_PROBE_ADC_FILE="$adc_file_override" probe_colab_command "$auth_mode" "$acct" "$timeout_sec" whoami 2>/dev/null)" || probe_rc=$?
   else
-    if ! out="$(probe_colab_command "$auth_mode" "$acct" "$timeout_sec" whoami 2>/dev/null)"; then
-      return 1
-    fi
+    out="$(probe_colab_command "$auth_mode" "$acct" "$timeout_sec" whoami 2>/dev/null)" || probe_rc=$?
+  fi
+  if [[ "$probe_rc" -ne 0 ]]; then
+    return "$probe_rc"
   fi
 
   local adc_for_parse="$adc_file_override"
@@ -142,6 +154,24 @@ probe_colab_identity_and_scopes() {
   fi
 
   printf '%s' "$out" | account_store parse-whoami "$auth_mode" - --adc-file "$adc_for_parse"
+}
+
+_has_local_auth_credentials() {
+  local mode="${1:-$COLAB_AUTH_MODE}"
+  local acct="${2:-$ACTIVE_ACCOUNT}"
+  if [[ "$mode" == "adc" ]]; then
+    local adc_file=""
+    adc_file="$(colab_adc_credentials_path "$acct" 2>/dev/null || true)"
+    [[ -n "$adc_file" && -f "$adc_file" ]]
+    return $?
+  fi
+  if account_store oauth-has-active >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -n "$acct" ]] && account_store exists "$ACCOUNTS_DIR" "$acct" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
 }
 
 format_short_scopes() {
@@ -223,7 +253,7 @@ _adopt_external_login_if_valid() {
 }
 
 refresh_colab_auth_status() {
-  local timeout_sec="${1:-4}"
+  local timeout_sec="${1:-$COLABD_AUTH_PROBE_TIMEOUT}"
   local force_whoami="${2:-0}"
 
   AUTH_MISSING_REQ_SCOPES=""
@@ -288,11 +318,14 @@ refresh_colab_auth_status() {
   fi
 
   local probe_out=""
+  local probe_rc=0
   local sess_ok=0
   if probe_out="$(probe_colab_command "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$timeout_sec" sessions 2>/dev/null)"; then
     if ! _sessions_output_indicates_auth_error "$probe_out"; then
       sess_ok=1
     fi
+  else
+    probe_rc=$?
   fi
 
   if [[ "$sess_ok" -eq 1 ]]; then
@@ -307,7 +340,8 @@ refresh_colab_auth_status() {
     # and re-verify when forced, un-adopted, missing email, or previously flagged missing_required_scopes.
     if [[ "$COLAB_AUTH_MODE" == "adc" || "$force_whoami" == "1" || -z "$ACTIVE_ACCOUNT" || -z "$AUTH_EMAIL" || -n "$AUTH_MISSING_REQ_SCOPES" ]]; then
       local w_tsv=""
-      if w_tsv="$(probe_colab_identity_and_scopes "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" 5 2>/dev/null)"; then
+      local w_rc=0
+      if w_tsv="$(probe_colab_identity_and_scopes "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$timeout_sec" 2>/dev/null)"; then
         local w_email w_checked w_mreq w_mopt w_scopes
         IFS="$FIELD_SEP" read -r w_email w_checked w_mreq w_mopt w_scopes <<< "$w_tsv"
         [[ -n "$w_email" ]] && AUTH_EMAIL="$w_email"
@@ -331,10 +365,18 @@ refresh_colab_auth_status() {
         if [[ -z "$ACTIVE_ACCOUNT" && -n "$AUTH_EMAIL" && ( "$COLAB_AUTH_MODE" == "oauth2" || "${AUTO_ADOPT_EXTERNAL:-1}" == "1" ) ]]; then
           _adopt_external_login_if_valid "$COLAB_AUTH_MODE" "$AUTH_EMAIL" "$w_scopes" "$w_mopt" || true
         fi
-      elif [[ "$COLAB_AUTH_MODE" == "adc" ]]; then
-        AUTH_STATE="unauth"
-        AUTH_DETAIL="ADC 凭证无效或已过期 (请运行 colabd auth refresh ${ACTIVE_ACCOUNT})"
-        return 1
+      else
+        w_rc=$?
+        if [[ "$COLAB_AUTH_MODE" == "adc" ]]; then
+          if [[ "$w_rc" -eq 124 ]]; then
+            AUTH_STATE="timeout"
+            AUTH_DETAIL="ADC 认证状态探测超时 (${timeout_sec}s，可能正在刷新令牌或网络较慢)"
+            return 1
+          fi
+          AUTH_STATE="unauth"
+          AUTH_DETAIL="ADC 凭证无效或已过期 (请运行 colabd auth refresh ${ACTIVE_ACCOUNT})"
+          return 1
+        fi
       fi
     fi
 
@@ -347,9 +389,17 @@ refresh_colab_auth_status() {
     AUTH_STATE="ok"
     return 0
   else
+    # Timeout (rc=124) while local credentials exist is a slow OAuth refresh / network stall,
+    # NOT an expired/logged-out account — never misreport it as `unauth`!
+    if [[ "$probe_rc" -eq 124 ]] && _has_local_auth_credentials "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT"; then
+      AUTH_STATE="timeout"
+      AUTH_DETAIL="认证状态探测超时 (${timeout_sec}s，可能正在刷新 OAuth 令牌或网络较慢；本地凭证保留)"
+      return 1
+    fi
+
     # sessions failed — inspect whoami to distinguish missing scopes (403) from truly unauthenticated
     local w_tsv=""
-    if w_tsv="$(probe_colab_identity_and_scopes "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" 5 2>/dev/null)"; then
+    if w_tsv="$(probe_colab_identity_and_scopes "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$timeout_sec" 2>/dev/null)"; then
       local w_email w_checked w_mreq w_mopt w_scopes
       IFS="$FIELD_SEP" read -r w_email w_checked w_mreq w_mopt w_scopes <<< "$w_tsv"
       [[ -n "$w_email" ]] && AUTH_EMAIL="$w_email"
@@ -406,6 +456,9 @@ format_auth_badge() {
       ;;
     missing_cli)
       echo "${C_RED}✗ 未初始化独立 uv 运行环境${C_RESET} (请执行 'colabd env setup' 或进菜单 [6]->[9])"
+      ;;
+    timeout)
+      echo "${C_YELLOW}◌ 认证状态探测超时${C_RESET} (${id_part}模式: ${COLAB_AUTH_MODE} — 令牌刷新中或网络较慢，凭证保留，可重试)"
       ;;
     unauth)
       echo "${C_YELLOW}○ 未登录或令牌已过期${C_RESET} (${id_part}模式: ${COLAB_AUTH_MODE} — 请进菜单 [6] 登录或切号)"
@@ -603,7 +656,7 @@ _authenticate_and_save_account() {
         echo "${C_RED}[失败] OAuth 2.0 登录未完成或被取消，正在恢复原账号凭证...${C_RESET}"
         restore_oauth_swap_if_needed
         rm -f "$tmp_sess" "${tmp_sess}.lock"
-        refresh_colab_auth_status 4 0 || true
+        refresh_colab_auth_status "" 0 || true
         return 1
       fi
     else
@@ -632,7 +685,7 @@ _authenticate_and_save_account() {
     local w_tsv=""
     local adc_probe_arg=""
     [[ "$mode" == "adc" ]] && adc_probe_arg="$tmp_adc"
-    w_tsv="$(COLABD_PROBE_SESSIONS_FILE="$tmp_sess" probe_colab_identity_and_scopes "$mode" "" 8 "$adc_probe_arg" 2>/dev/null || true)"
+    w_tsv="$(COLABD_PROBE_SESSIONS_FILE="$tmp_sess" probe_colab_identity_and_scopes "$mode" "" "$COLABD_AUTH_PROBE_TIMEOUT" "$adc_probe_arg" 2>/dev/null || true)"
 
     local new_email="" scope_checked="0" missing_req="" missing_opt="" all_scopes=""
     if [[ -n "$w_tsv" ]]; then
@@ -671,7 +724,7 @@ _authenticate_and_save_account() {
         restore_oauth_swap_if_needed
       fi
       rm -f "$backup_file" "$tmp_sess" "${tmp_sess}.lock" "$tmp_adc"
-      refresh_colab_auth_status 4 0 || true
+      refresh_colab_auth_status "" 0 || true
       return 1
     fi
 
@@ -679,13 +732,13 @@ _authenticate_and_save_account() {
     local sess_check_out=""
     local sess_check_ok=0
     if [[ "$mode" == "adc" ]]; then
-      if sess_check_out="$(COLABD_PROBE_SESSIONS_FILE="$tmp_sess" COLABD_PROBE_ADC_FILE="$tmp_adc" probe_colab_command "$mode" "" 8 sessions 2>&1)"; then
+      if sess_check_out="$(COLABD_PROBE_SESSIONS_FILE="$tmp_sess" COLABD_PROBE_ADC_FILE="$tmp_adc" probe_colab_command "$mode" "" "$COLABD_AUTH_PROBE_TIMEOUT" sessions 2>&1)"; then
         if ! _sessions_output_indicates_auth_error "$sess_check_out"; then
           sess_check_ok=1
         fi
       fi
     else
-      if sess_check_out="$(COLABD_PROBE_SESSIONS_FILE="$tmp_sess" probe_colab_command "$mode" "" 8 sessions 2>&1)"; then
+      if sess_check_out="$(COLABD_PROBE_SESSIONS_FILE="$tmp_sess" probe_colab_command "$mode" "" "$COLABD_AUTH_PROBE_TIMEOUT" sessions 2>&1)"; then
         if ! _sessions_output_indicates_auth_error "$sess_check_out"; then
           sess_check_ok=1
         fi
@@ -704,7 +757,7 @@ _authenticate_and_save_account() {
         restore_oauth_swap_if_needed
       fi
       rm -f "$backup_file" "$tmp_sess" "${tmp_sess}.lock" "$tmp_adc"
-      refresh_colab_auth_status 4 0 || true
+      refresh_colab_auth_status "" 0 || true
       return 1
     fi
 
@@ -750,7 +803,7 @@ _authenticate_and_save_account() {
               restore_oauth_swap_if_needed
             fi
             rm -f "$backup_file" "$tmp_sess" "${tmp_sess}.lock" "$tmp_adc"
-            refresh_colab_auth_status 4 0 || true
+            refresh_colab_auth_status "" 0 || true
             return 1
             ;;
         esac
@@ -760,7 +813,7 @@ _authenticate_and_save_account() {
           restore_oauth_swap_if_needed
         fi
         rm -f "$backup_file" "$tmp_sess" "${tmp_sess}.lock" "$tmp_adc"
-        refresh_colab_auth_status 4 0 || true
+        refresh_colab_auth_status "" 0 || true
         return 1
       fi
     fi
@@ -994,7 +1047,7 @@ do_switch_account() {
     COLAB_AUTH_MODE="$target_mode"
     AUTO_ADOPT_EXTERNAL="1"
     save_config
-    refresh_colab_auth_status 6 1 || true
+    refresh_colab_auth_status "" 1 || true
     echo "${C_GREEN}[提示] 当前已位于账号 '${target_id}'，状态与权限域已刷新。${C_RESET}"
     return 0
   fi
@@ -1028,11 +1081,14 @@ do_switch_account() {
   AUTH_NOTE="$target_note"
   save_config
 
-  if refresh_colab_auth_status 6 1; then
+  if refresh_colab_auth_status "" 1; then
     echo "${C_GREEN}[切号成功] 当前激活账号: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")${C_RESET}"
     return 0
   elif [[ "$AUTH_STATE" == "insufficient_scope" ]]; then
     echo "${C_RED}[已切换但权限域缺失] ${AUTH_DETAIL}${C_RESET}"
+    return 1
+  elif [[ "$AUTH_STATE" == "timeout" ]]; then
+    echo "${C_YELLOW}[已切换但探测超时] 账号 '${ACTIVE_ACCOUNT}' 本地凭证已激活，但远端校验超时 (${AUTH_DETAIL})；请稍后执行 'colabd auth whoami' 确认。${C_RESET}"
     return 1
   else
     echo "${C_YELLOW}[已切换但令牌失效] 账号 '${ACTIVE_ACCOUNT}' 校验未通过 (${AUTH_DETAIL})，请运行 'colabd auth refresh ${ACTIVE_ACCOUNT}'。${C_RESET}"
@@ -1228,7 +1284,7 @@ do_install_or_update_cli() {
     fi
     ensure_managed_uv_env "install" || return 1
   fi
-  refresh_colab_auth_status 5 0 || true
+  refresh_colab_auth_status "" 0 || true
 }
 
 ensure_cli_and_authenticated() {
@@ -1242,7 +1298,38 @@ ensure_cli_and_authenticated() {
     resolve_colab_bin >/dev/null 2>&1 || return 1
   fi
 
-  if ! refresh_colab_auth_status 5 0; then
+  if ! refresh_colab_auth_status "" 0; then
+    if [[ "$AUTH_STATE" == "timeout" ]]; then
+      local retry_timeout=30
+      if [[ "${COLABD_AUTH_PROBE_TIMEOUT:-15}" =~ ^[0-9]+$ && "${COLABD_AUTH_PROBE_TIMEOUT:-15}" -gt 0 ]]; then
+        retry_timeout=$((COLABD_AUTH_PROBE_TIMEOUT * 2))
+      fi
+      echo ""
+      echo "${C_YELLOW}[认证探测超时] ${AUTH_DETAIL}${C_RESET}"
+      echo "${C_CYAN}[自动重试] 正在以更长超时 (${retry_timeout}s) 等待 OAuth 令牌刷新并复检...${C_RESET}"
+      if refresh_colab_auth_status "$retry_timeout" 0; then
+        return 0
+      fi
+      if [[ "$AUTH_STATE" == "timeout" ]]; then
+        echo "${C_YELLOW}[探测仍超时] ${AUTH_DETAIL}${C_RESET}"
+        echo "  本地凭证仍在，无需重复登录；可能是网络或代理响应较慢。"
+        echo "  1) 直接继续启动（跳过本次预检，交由 colab CLI 自动完成刷新）"
+        echo "  2) 再次重试认证状态探测"
+        echo "  3) 重新登录 / 切换账号"
+        echo "  0) 取消并返回主菜单"
+        read -r -p "请选择 [1]: " timeout_choice
+        case "${timeout_choice:-1}" in
+          1) return 0 ;;
+          2)
+            refresh_colab_auth_status "$retry_timeout" 0 && return 0
+            return 1
+            ;;
+          3) ;;
+          *) return 1 ;;
+        esac
+      fi
+    fi
+
     echo ""
     if [[ "$AUTH_STATE" == "insufficient_scope" ]]; then
       echo "${C_RED}[权限域不足] ${AUTH_DETAIL}${C_RESET}"

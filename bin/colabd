@@ -102,7 +102,7 @@ handle_auth_cli() {
       return 0
       ;;
     whoami|status)
-      if refresh_colab_auth_status 6 1; then
+      if refresh_colab_auth_status "" 1; then
         echo "当前账号: $(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")"
         colab_cli whoami 2>&1 || true
         colab_cli sessions 2>&1 || true
@@ -111,6 +111,9 @@ handle_auth_cli() {
       elif [[ "$AUTH_STATE" == "insufficient_scope" ]]; then
         echo "[权限域不足] ${AUTH_DETAIL}" >&2
         colab_cli whoami 2>&1 || true
+        return 1
+      elif [[ "$AUTH_STATE" == "timeout" ]]; then
+        echo "[探测超时] ${AUTH_DETAIL}" >&2
         return 1
       else
         echo "当前未登录或令牌失效: ${AUTH_DETAIL}" >&2
@@ -134,7 +137,7 @@ handle_auth_cli() {
         esac
         shift
       done
-      refresh_colab_auth_status 4 0 || true
+      refresh_colab_auth_status "" 0 || true
       do_switch_account "$target" "$mode"
       return $?
       ;;
@@ -168,7 +171,7 @@ handle_auth_cli() {
         esac
         shift
       done
-      refresh_colab_auth_status 4 0 || true
+      refresh_colab_auth_status "" 0 || true
       do_login_account "$auth_m" "$note" "$mode"
       return $?
       ;;
@@ -188,7 +191,7 @@ handle_auth_cli() {
         esac
         shift
       done
-      refresh_colab_auth_status 4 0 || true
+      refresh_colab_auth_status "" 0 || true
       do_refresh_account "$target" "$interactive"
       return $?
       ;;
@@ -230,7 +233,7 @@ handle_auth_cli() {
         esac
         shift
       done
-      refresh_colab_auth_status 4 0 || true
+      refresh_colab_auth_status "" 0 || true
       do_remove_account "$target" "$mode" "0" "$revoke_remote" "$force_unverified"
       return $?
       ;;
@@ -254,7 +257,7 @@ handle_auth_cli() {
         esac
         shift
       done
-      refresh_colab_auth_status 4 0 || true
+      refresh_colab_auth_status "" 0 || true
       do_logout_current_account "$mode" "0" "$revoke_remote" "$force_unverified"
       return $?
       ;;
@@ -303,12 +306,12 @@ handle_down_cli() {
     return $?
   fi
 
-  refresh_colab_auth_status 4 0 || true
+  refresh_colab_auth_status "" 0 || true
   local sess_cfg=""
   sess_cfg="$(colab_session_config_path "$ACTIVE_ACCOUNT")"
   local has_local=""
   has_local="$(account_store sessions-list "$sess_cfg" 2>/dev/null || true)"
-  if [[ -n "$has_local" ]] || { [[ "$AUTH_STATE" == "ok" ]] && colab_session_is_active "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$SESSION_NAME"; }; then
+  if [[ -n "$has_local" ]] || { [[ "$AUTH_STATE" == "ok" || "$AUTH_STATE" == "timeout" ]] && colab_session_is_active "$COLAB_AUTH_MODE" "$ACTIVE_ACCOUNT" "$SESSION_NAME"; }; then
     stop_colab_instance
     return $?
   fi

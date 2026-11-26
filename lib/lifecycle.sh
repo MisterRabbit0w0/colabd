@@ -26,7 +26,7 @@ colab_session_is_active() {
   local sess_name="$3"
 
   local out=""
-  if ! out="$(probe_colab_command "$auth_mode" "$acct" 8 status -s "$sess_name" 2>&1)"; then
+  if ! out="$(probe_colab_command "$auth_mode" "$acct" "$COLABD_AUTH_PROBE_TIMEOUT" status -s "$sess_name" 2>&1)"; then
     return 1
   fi
   if _sessions_output_indicates_auth_error "$out"; then
@@ -110,7 +110,7 @@ _collect_sessions_for_account_cb() {
   local live_out=""
   local probe_err=""
   if resolve_colab_bin >/dev/null 2>&1; then
-    if ! live_out="$(probe_colab_command "$mode" "$acct" 6 sessions 2>&1)"; then
+    if ! live_out="$(probe_colab_command "$mode" "$acct" "$COLABD_AUTH_PROBE_TIMEOUT" sessions 2>&1)"; then
       probe_err="${live_out:-远端 colab sessions 探测失败}"
       live_out=""
     elif _sessions_output_indicates_auth_error "$live_out"; then
@@ -118,7 +118,7 @@ _collect_sessions_for_account_cb() {
       live_out=""
     elif [[ "$mode" == "adc" ]]; then
       # Real `colab --auth adc sessions` swallows SystemExit on empty sessions; verify ADC via whoami too!
-      if ! probe_colab_command "$mode" "$acct" 6 whoami >/dev/null 2>&1; then
+      if ! probe_colab_command "$mode" "$acct" "$COLABD_AUTH_PROBE_TIMEOUT" whoami >/dev/null 2>&1; then
         probe_err="ADC 凭证无效或已过期 (colab whoami 校验失败)"
         live_out=""
       fi
@@ -676,7 +676,7 @@ stop_colab_instance() {
     run_with_account_creds "$owner_acct" "$owner_mode" _release_sessions_for_account_cb "$target" "0" || rc=$?
   elif [[ -n "$has_local_sessions" ]]; then
     run_with_account_creds "$owner_acct" "$owner_mode" _release_sessions_for_account_cb "" "0" || rc=$?
-  elif [[ "$AUTH_STATE" == "ok" ]] && colab_session_is_active "$owner_mode" "$owner_acct" "$target"; then
+  elif [[ "$AUTH_STATE" == "ok" || "$AUTH_STATE" == "timeout" ]] && colab_session_is_active "$owner_mode" "$owner_acct" "$target"; then
     run_with_account_creds "$owner_acct" "$owner_mode" _release_sessions_for_account_cb "$target" "0" || rc=$?
   fi
 
@@ -812,7 +812,7 @@ release_all_accounts_runtimes() {
   fi
 
   echo "${C_GREEN}[全局释放完成] 共扫描 ${scanned} 个账号，触发释放 ${released_accounts} 个账号的活跃实例。${C_RESET}"
-  refresh_colab_auth_status 4 0 || true
+  refresh_colab_auth_status "" 0 || true
   [[ "$any_failed" -eq 0 ]]
 }
 

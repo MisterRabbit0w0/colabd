@@ -277,6 +277,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 KR_FILE = pathlib.Path(os.environ["COLABD_KEYRING_FILE"])
 SRV_FILE = pathlib.Path(os.environ["MOCK_SERVER_STATE"])
@@ -342,6 +343,10 @@ if sub == "whoami" and ("--help" in sub_args or "-h" in sub_args):
 if sub == "logout":
     print("No such command 'logout'.", file=sys.stderr)
     sys.exit(2)
+
+delay_s = float(os.environ.get("MOCK_PROBE_DELAY_SEC", "0") or "0")
+if delay_s > 0 and sub in ("sessions", "whoami"):
+    time.sleep(delay_s)
 
 def next_scopes(mode):
     if NEXT_SCOPES_FILE and NEXT_SCOPES_FILE.is_file():
@@ -802,6 +807,60 @@ PATH="${MULTI_BOX}/mockbin:$PATH" bash --noprofile --norc -c "
   fi
 " 2>/dev/null
 python3 "${ROOT_DIR}/lib/account_store.py" exists "${XDG_CONFIG_HOME}/colabd/accounts" "repair@example.com"
+
+# 6e. Slow OAuth 2.0 1-hour refresh / probe timeout MUST NOT be misreported as expired (`unauth`)
+TIMEOUT_WHOAMI_RC=0
+TIMEOUT_WHOAMI_OUT="$(MOCK_PROBE_DELAY_SEC=1.5 COLABD_AUTH_PROBE_TIMEOUT=0.4 run_colabd auth whoami 2>&1)" || TIMEOUT_WHOAMI_RC=$?
+[[ "$TIMEOUT_WHOAMI_RC" -ne 0 ]] || { echo "Expected timed-out whoami to exit non-zero!" >&2; exit 1; }
+printf '%s\n' "$TIMEOUT_WHOAMI_OUT" | grep -q '探测超时'
+if printf '%s\n' "$TIMEOUT_WHOAMI_OUT" | grep -q '未登录或令牌失效'; then
+  echo "Timed-out OAuth probe falsely reported expired/unauth!" >&2
+  exit 1
+fi
+
+PATH="${MULTI_BOX}/mockbin:$PATH" bash --noprofile --norc -c "
+  set -euo pipefail
+  export TMPDIR='${SANDBOX}/tmp'
+  COLABD_LIB_DIR='${ROOT_DIR}/lib'
+  source '${ROOT_DIR}/lib/core.sh'
+  source '${ROOT_DIR}/lib/env.sh'
+  source '${ROOT_DIR}/lib/auth.sh'
+  source '${ROOT_DIR}/lib/lifecycle.sh'
+  load_config
+
+  # Default probe timeout must be >= 15s to accommodate automatic 1-hour OAuth refresh
+  [[ \"\${COLABD_AUTH_PROBE_TIMEOUT}\" -ge 15 ]]
+
+  # Timeout with valid local credentials -> AUTH_STATE=timeout (NOT unauth!) and accurate badge
+  if MOCK_PROBE_DELAY_SEC=1.5 refresh_colab_auth_status 0.4 0; then
+    echo 'Expected refresh_colab_auth_status to fail on 0.4s timeout!' >&2
+    exit 1
+  fi
+  [[ \"\$AUTH_STATE\" == \"timeout\" ]] || { echo \"Expected AUTH_STATE=timeout, got \$AUTH_STATE\" >&2; exit 1; }
+  BADGE=\"\$(format_auth_badge)\"
+  printf '%s\n' \"\$BADGE\" | grep -q '认证状态探测超时'
+  if printf '%s\n' \"\$BADGE\" | grep -q '未登录或令牌已过期'; then
+    echo \"False expiry badge emitted on timeout: \$BADGE\" >&2
+    exit 1
+  fi
+
+  # ensure_cli_and_authenticated automatically retries with 2x timeout and recovers cleanly
+  COLABD_AUTH_PROBE_TIMEOUT=1 MOCK_PROBE_DELAY_SEC=1.3 ensure_cli_and_authenticated >/dev/null
+  [[ \"\$AUTH_STATE\" == \"ok\" ]] || { echo \"Expected AUTH_STATE=ok after auto-retry, got \$AUTH_STATE\" >&2; exit 1; }
+
+  # Timeout with NO local credentials at all still reports unauth
+  EMPTY_KR='${SANDBOX}/empty_kr_timeout.json'
+  printf '{}\n' > \"\$EMPTY_KR\"
+  ACTIVE_ACCOUNT=''
+  COLAB_AUTH_MODE='oauth2'
+  if COLABD_KEYRING_FILE=\"\$EMPTY_KR\" MOCK_PROBE_DELAY_SEC=1.5 refresh_colab_auth_status 0.4 0; then
+    echo 'Expected refresh_colab_auth_status to fail with no credentials!' >&2
+    exit 1
+  fi
+  [[ \"\$AUTH_STATE\" == \"unauth\" ]] || { echo \"Expected AUTH_STATE=unauth without local creds, got \$AUTH_STATE\" >&2; exit 1; }
+
+  rm -rf \"\$STATE_DIR\"
+"
 
 # Verify zero server-side sessions remain across all accounts!
 python3 - "$MOCK_SERVER_STATE" <<'PYCHK'
