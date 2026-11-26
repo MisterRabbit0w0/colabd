@@ -1,0 +1,17 @@
+# Local secrets and runtime configs
+*.env
+config.env*
+token.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Temporary logs and test sandboxes
+*.log
+*.tmp
+*.part
+.DS_Store
+.idea/
+.vscode/

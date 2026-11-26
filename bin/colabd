@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# colabd - The endgame for frontier LLM serving on Google Colab.
+# Repository: https://github.com/MisterRabbit0w0/colabd
+# License: MIT
+# ==============================================================================
+
+set -uo pipefail
+
+resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    local dir
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+COLABD_BIN_DIR="$(resolve_script_dir)"
+COLABD_ROOT="$(cd -P "${COLABD_BIN_DIR}/.." && pwd)"
+COLABD_LIB_DIR="${COLABD_ROOT}/lib"
+
+# shellcheck source=../lib/core.sh
+source "${COLABD_LIB_DIR}/core.sh"
+# shellcheck source=../lib/auth.sh
+source "${COLABD_LIB_DIR}/auth.sh"
+# shellcheck source=../lib/lifecycle.sh
+source "${COLABD_LIB_DIR}/lifecycle.sh"
+# shellcheck source=../lib/ui.sh
+source "${COLABD_LIB_DIR}/ui.sh"
+
+trap 'exit 130' INT
+trap cleanup_on_exit EXIT TERM HUP
+
+print_help() {
+  cat <<EOF
+colabd v${COLABD_VERSION}
+The endgame for frontier LLM serving on Google Colab.
+
+Usage:
+  colabd                  Launch the interactive TUI control panel (default)
+  colabd up               Start the configured Colab runtime and enter the TUI tether
+  colabd auth             Open the Google Colab account login and GCP auth center
+  colabd settings         Open the persistent configuration menu
+  colabd down             Immediately stop the configured Colab runtime session
+  colabd version          Print colabd version
+  colabd help             Show this help message
+
+Configuration:
+  ${CONFIG_FILE} (mode 0600)
+
+Lifecycle safety:
+  Exiting the interactive session or pressing Ctrl+C automatically runs
+  'colab stop' to release your Colab GPU runtime and stop Compute Unit burn.
+EOF
+}
+
+main() {
+  load_config
+  local sub="${1:-}"
+  case "$sub" in
+    -h|--help|help)
+      COLABD_SKIP_AUTO_STOP=1
+      print_help
+      exit 0
+      ;;
+    -v|--version|version)
+      COLABD_SKIP_AUTO_STOP=1
+      echo "colabd ${COLABD_VERSION}"
+      exit 0
+      ;;
+    up)
+      action_start_or_restart
+      run_interactive_loop
+      ;;
+    auth)
+      COLABD_SKIP_AUTO_STOP=1
+      page_account_auth
+      exit 0
+      ;;
+    settings|config)
+      COLABD_SKIP_AUTO_STOP=1
+      page_settings
+      exit 0
+      ;;
+    down|stop)
+      COLABD_SKIP_AUTO_STOP=1
+      refresh_colab_auth_status 4 || true
+      MANAGED_SESSION=1
+      stop_colab_instance
+      exit 0
+      ;;
+    "")
+      run_interactive_loop
+      ;;
+    *)
+      COLABD_SKIP_AUTO_STOP=1
+      echo "[ERROR] Unknown command: ${sub}" >&2
+      print_help >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
