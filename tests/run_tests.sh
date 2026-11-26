@@ -11,24 +11,27 @@ set -euo pipefail
 ROOT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "[1/8] Checking Bash syntax and Python bytecode compilation..."
+echo "[1/9] Checking Bash syntax and Python bytecode compilation..."
 bash -n bin/colabd lib/*.sh scripts/*.sh tests/*.sh
 python3 -m py_compile lib/*.py
 
-echo "[2/8] Testing CLI subcommands (--version, --help) and local installer..."
+echo "[2/9] Testing CLI subcommands (--version, --help, models) and local installer..."
 SANDBOX="$(mktemp -d "${ROOT_DIR}/.test_sandbox.XXXXXX")"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 VER_OUT="$(XDG_CONFIG_HOME="${SANDBOX}/fresh_cfg" "${ROOT_DIR}/bin/colabd" --version)"
 [[ "$VER_OUT" == "colabd 0.1.0" ]] || { echo "Unexpected version: $VER_OUT" >&2; exit 1; }
 XDG_CONFIG_HOME="${SANDBOX}/fresh_cfg" "${ROOT_DIR}/bin/colabd" --help >/dev/null
-[[ ! -e "${SANDBOX}/fresh_cfg/colabd/config.env" ]] || { echo "--help/--version must not create config.env" >&2; exit 1; }
+MODELS_OUT="$(XDG_CONFIG_HOME="${SANDBOX}/fresh_cfg" "${ROOT_DIR}/bin/colabd" models --tier free --engine strata)"
+printf '%s\n' "$MODELS_OUT" | grep -q 'strata-inkling-uncensored-sq10'
+[[ ! -e "${SANDBOX}/fresh_cfg/colabd/config.env" ]] || { echo "--help/--version/models must not create config.env" >&2; exit 1; }
 
 COLABD_HOME="${SANDBOX}/share/colabd" COLABD_RUNTIME_DIR="${SANDBOX}/inst_rt" COLABD_BIN_DIR="${SANDBOX}/bin" \
   COLABD_SKIP_VENV_SETUP=1 bash "${ROOT_DIR}/scripts/install.sh" >/dev/null
 [[ -L "${SANDBOX}/bin/colabd" ]] || { echo "Symlink not created by install.sh" >&2; exit 1; }
 [[ -f "${SANDBOX}/share/colabd/lib/env.sh" ]] || { echo "env.sh not installed" >&2; exit 1; }
 [[ -f "${SANDBOX}/share/colabd/lib/account_store.py" ]] || { echo "account_store.py not installed" >&2; exit 1; }
+[[ -f "${SANDBOX}/share/colabd/lib/model_registry.py" ]] || { echo "model_registry.py not installed" >&2; exit 1; }
 [[ ! -d "${SANDBOX}/share/colabd/lib/__pycache__" ]] || { echo "install.sh must strip __pycache__ from installed lib/" >&2; exit 1; }
 [[ "$(XDG_CONFIG_HOME="${SANDBOX}/fresh_cfg" "${SANDBOX}/bin/colabd" version)" == "colabd 0.1.0" ]] || { echo "Installed binary failed" >&2; exit 1; }
 
@@ -59,7 +62,7 @@ if grep -q 'rt-purge' "${SANDBOX}/purge_kr.json"; then
   exit 1
 fi
 
-echo "[3/8] Testing Google Drive shard prefetch, NVMe routing, fallback sync-back, and mmap patching..."
+echo "[3/9] Testing Google Drive shard prefetch, NVMe routing, fallback sync-back, and mmap patching..."
 mkdir -p "${SANDBOX}/tmp" "${SANDBOX}/cfg" "${SANDBOX}/work/maya-models" \
   "${SANDBOX}/drive/maya-models/Engram-Q6_K" \
   "${SANDBOX}/drive/maya-models/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-128G"
@@ -149,7 +152,7 @@ finally:
     shutil.disk_usage = orig_du
 PYTEST
 
-echo "[4/8] Testing account_store.py identity deduplication, scope parser, 0600 perms, and revocation..."
+echo "[4/9] Testing account_store.py identity deduplication, scope parser, 0600 perms, and revocation..."
 python3 - "$ROOT_DIR" "$SANDBOX" <<'PYSTORE'
 import json
 import os
@@ -254,7 +257,7 @@ assert "REVOKE token=rt-a" in revoke_log.read_text()
 assert run_store("exists", str(accts), "alice@example.com", check=False).returncode != 0
 PYSTORE
 
-echo "[5/8] Testing identity-based CRUD, deduplication, cross-account release, and fail-closed delete gate..."
+echo "[5/9] Testing identity-based CRUD, deduplication, cross-account release, and fail-closed delete gate..."
 MULTI_BOX="${SANDBOX}/multi"
 mkdir -p "${MULTI_BOX}/mockbin" "${MULTI_BOX}/cfg" "${MULTI_BOX}/colab_cli" "${MULTI_BOX}/gcloud_cfg"
 
@@ -726,7 +729,7 @@ fi
 run_colabd auth remove adc:gcp3@corp.example.com --release --force >/dev/null
 [[ ! -d "$GCP3_DIR" ]] || { echo "--force did not remove invalid gcp3 dir!" >&2; exit 1; }
 
-echo "[6/8] Testing missing scope detection, login rejection, auth refresh repair, and running-daemon delete block..."
+echo "[6/9] Testing missing scope detection, login rejection, auth refresh repair, and running-daemon delete block..."
 # 6a. Login with missing `colaboratory` scope MUST pass OAUTHLIB_RELAX_TOKEN_SCOPE=1,
 #     reach colabd's own scope check, be rejected, and NOT be saved
 echo "noscope@example.com" > "$MOCK_NEXT_LOGIN_FILE"
@@ -808,14 +811,14 @@ leftover = {k: v for k, v in srv.items() if v}
 assert not leftover, f"Leaked server sessions remained: {leftover}"
 PYCHK
 
-echo "[7/8] Testing interactive TUI settings and exit auto-stop..."
+echo "[7/9] Testing interactive TUI settings and exit auto-stop..."
 REPAIR_DIR="$(python3 "${ROOT_DIR}/lib/account_store.py" path "${XDG_CONFIG_HOME}/colabd/accounts" "repair@example.com")"
 PATH="${MULTI_BOX}/mockbin:$PATH" colab --config "${REPAIR_DIR}/sessions.json" --auth oauth2 new -s colabd-llm --gpu G4 >/dev/null
 printf '5\n4\nY\n2\n0\n0\n' | run_colabd >/dev/null 2>&1
 grep -q '^DRIVE_SAVE_POLICY=weights_only$' "${XDG_CONFIG_HOME}/colabd/config.env"
 grep -q 'STOPPED ident=repair@example.com mode=oauth2 session=colabd-llm ep=m-repair-colabd-llm' "$MOCK_CALL_LOG"
 
-echo "[8/8] Testing colabd managed isolated uv venv runtime (works with zero external colab on PATH)..."
+echo "[8/9] Testing colabd managed isolated uv venv runtime (works with zero external colab on PATH)..."
 ENV_BOX="${SANDBOX}/uv_env"
 mkdir -p "${ENV_BOX}/home" "${ENV_BOX}/uvbin" "${ENV_BOX}/cfg" "${ENV_BOX}/colab_cli"
 REAL_PY3="$(python3 -c 'import sys; print(sys.executable)')"
@@ -932,5 +935,225 @@ if run_isolated_colabd doctor >/dev/null 2>&1; then
   echo "Expected doctor to fail when managed venv removed and no external colab exists" >&2
   exit 1
 fi
+
+echo "[9/9] Testing multi-engine registry (Strata + Project Maya), Free T4 CLI switching, driver floor, health JSON, and ablation patching..."
+ENG_BOX="${SANDBOX}/multi_engine"
+mkdir -p "${ENG_BOX}/cfg/colabd" "${ENG_BOX}/tmp" "${ENG_BOX}/work/maya-models" \
+  "${ENG_BOX}/drive/maya-models/Inkling-2-Mini-Abliterated-Strata"
+
+# 9a. Legacy v0.1.0 config migration: config without ENGINE_TYPE preserves Maya + ds4-abliterated-128g
+cat > "${ENG_BOX}/cfg/colabd/config.env" <<'LEGCFG'
+SESSION_NAME=legacy-sess
+GPU_TYPE=G4
+HIGH_MEM=1
+MODEL_PRESET=ds4-abliterated-128g
+STORAGE_MODE=drive_hybrid
+LEGCFG
+
+XDG_CONFIG_HOME="${ENG_BOX}/cfg" bash --noprofile --norc -c "
+  set -euo pipefail
+  export TMPDIR='${ENG_BOX}/tmp'
+  COLABD_LIB_DIR='${ROOT_DIR}/lib'
+  source '${ROOT_DIR}/lib/core.sh'
+  source '${ROOT_DIR}/lib/env.sh'
+  load_config
+  [[ \"\$STORAGE_MODE\" == 'nvme_engram' ]]
+  [[ \"\$ENGINE_TYPE\" == 'auto' ]]
+  [[ \"\$(resolve_effective_engine)\" == 'maya' ]]
+  [[ \"\$MAYA_ABLATION\" == 'on' ]]
+  [[ \"\$MAYA_ABLATE_DEFAULT\" == 'off' ]]
+  rm -rf \"\$STATE_DIR\"
+"
+
+# 9b. CLI `colabd use` auto-applies Free T4 hardware profile and `--keep-hw` preserves it
+XDG_CONFIG_HOME="${ENG_BOX}/cfg" NO_COLOR=1 bash --noprofile --norc "${ROOT_DIR}/bin/colabd" \
+  use strata-inkling-uncensored-sq10 >/dev/null
+grep -q '^MODEL_PRESET=strata-inkling-uncensored-sq10$' "${ENG_BOX}/cfg/colabd/config.env"
+grep -q '^GPU_TYPE=T4$' "${ENG_BOX}/cfg/colabd/config.env"
+grep -q '^HIGH_MEM=0$' "${ENG_BOX}/cfg/colabd/config.env"
+grep -q '^STORAGE_MODE=local_nvme$' "${ENG_BOX}/cfg/colabd/config.env"
+
+XDG_CONFIG_HOME="${ENG_BOX}/cfg" NO_COLOR=1 bash --noprofile --norc "${ROOT_DIR}/bin/colabd" \
+  use ds4-abliterated-128g --keep-hw >/dev/null
+grep -q '^MODEL_PRESET=ds4-abliterated-128g$' "${ENG_BOX}/cfg/colabd/config.env"
+grep -q '^GPU_TYPE=T4$' "${ENG_BOX}/cfg/colabd/config.env"
+grep -q '^HIGH_MEM=0$' "${ENG_BOX}/cfg/colabd/config.env"
+
+# 9c. Registry unit tests + Strata & Maya remote supervisor runner tests
+dd if=/dev/urandom of="${ENG_BOX}/drive/maya-models/Inkling-2-Mini-Abliterated-Strata/Inkling-2-Mini-SQ-10-abliterated.strata" bs=1024 count=24 2>/dev/null
+
+python3 - "$ROOT_DIR" "$ENG_BOX" <<'PYMULTI'
+import json
+import os
+import pathlib
+import py_compile
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+box = pathlib.Path(sys.argv[2])
+reg_py = root / "lib" / "model_registry.py"
+
+# Registry checks: legacy alias, custom Strata HF, custom Maya
+assert subprocess.check_output([sys.executable, str(reg_py), "exists", "inkling-2-mini"], text=True).strip() == "maya-inkling-2-mini"
+
+custom_strata = json.loads(
+    subprocess.check_output(
+        [
+            sys.executable,
+            str(reg_py),
+            "resolve",
+            "strata-custom-hf",
+            "--engine",
+            "strata",
+            "--hf-repo",
+            "AtomicChat/Inkling-2-Mini-Uncensored-GGUF",
+            "--hf-file",
+            "Inkling-2-Mini-Uncensored-AD-Q4_K.gguf",
+            "--family",
+            "inkling-2-mini",
+        ],
+        text=True,
+    )
+)
+assert custom_strata["engine"] == "strata"
+assert custom_strata["strata"]["hf_repo"] == "AtomicChat/Inkling-2-Mini-Uncensored-GGUF"
+assert custom_strata["strata"]["model_file"] == "Inkling-2-Mini-Uncensored-AD-Q4_K.gguf"
+assert custom_strata["strata"]["model"] == "UD-Q4_K_M"
+
+custom_maya = json.loads(
+    subprocess.check_output(
+        [
+            sys.executable,
+            str(reg_py),
+            "resolve",
+            "maya-custom",
+            "--engine",
+            "maya",
+            "--family",
+            "ds4:gguf-iq3_s",
+        ],
+        text=True,
+    )
+)
+assert custom_maya["engine"] == "maya"
+assert custom_maya["has_engram"] is True
+assert custom_maya["maya"]["ds4_quant"] == "gguf-iq3_s"
+
+# Build & test Strata runner (SC117 Inkling-2-Mini-abliterated SQ-10)
+strata_cmd = f"""
+export TMPDIR="{box}/tmp"
+export XDG_CONFIG_HOME="{box}/cfg"
+export COLABD_RUNTIME_DIR="{box}/rt"
+COLABD_LIB_DIR="{root}/lib"
+source "{root}/lib/core.sh"
+source "{root}/lib/env.sh"
+source "{root}/lib/auth.sh"
+source "{root}/lib/lifecycle.sh"
+load_config
+MODEL_PRESET="strata-inkling-uncensored-sq10"
+ENGINE_TYPE="auto"
+GPU_TYPE="T4"
+HIGH_MEM="0"
+MAYA_CONTEXT="65536"
+MAYA_DRAFTING="on"
+STRATA_KV_FORMAT="fp8"
+STRATA_PARALLEL="4"
+STRATA_BUILD_FALLBACK="auto"
+CUSTOM_MODELS_DIR="{box}/work/maya-models"
+DRIVE_CACHE_DIR="{box}/drive/maya-models"
+DRIVE_PREFETCH="1"
+DRIVE_SAVE_POLICY="both"
+build_remote_runner "local_nvme"
+echo "$RUNNER_PY"
+"""
+strata_runner = subprocess.check_output(["bash", "-c", strata_cmd], text=True).strip().splitlines()[-1]
+py_compile.compile(strata_runner, doraise=True)
+
+os.environ["MAYA_WORK_ROOT"] = str(box / "work")
+os.environ["MAYA_DRIVE_MOUNT_ROOT"] = str(box / "drive")
+os.environ["MAYA_SKIP_APT"] = "1"
+
+ns = {"__name__": "unit_test_strata"}
+exec(compile(pathlib.Path(strata_runner).read_text(), strata_runner, "exec"), ns)
+
+assert ns["ENGINE_TYPE"] == "strata"
+assert ns["choose_strata_install_mode"]("580.65.06", "auto") == "prebuilt"
+assert ns["choose_strata_install_mode"]("575.51", "auto") == "prebuilt"
+assert ns["choose_strata_install_mode"]("550.54.15", "auto") == "source"
+assert ns["choose_strata_install_mode"]("550.54.15", "prebuilt") == "prebuilt"
+assert ns["choose_strata_install_mode"]("580.65.06", "source") == "source"
+
+assert ns["check_health_response"](200, b'{"status":"ok","loaded":false,"service":"strata"}') == (False, "loading")
+assert ns["check_health_response"](200, b'{"status":"ok","loaded":true,"service":"strata"}') == (True, "ready")
+assert ns["check_health_response"](200, b"ok") == (True, "ready")
+assert ns["check_health_response"](503, b"busy") == (False, "unreachable")
+
+models_dir, ram_res = ns["prepare_storage_and_deps"]()
+assert ram_res is False
+local_strata = models_dir / "Inkling-2-Mini-Abliterated-Strata" / "Inkling-2-Mini-SQ-10-abliterated.strata"
+assert local_strata.exists()
+
+# Verify .strata sync-back to Drive works atomically
+new_vision = models_dir / "Inkling-2-Mini-Abliterated-Strata" / "Inkling-2-Mini-Vision.strata"
+new_vision.write_bytes(b"strata_vision_test" * 128)
+ns["sync_new_shards_to_drive"](models_dir)
+synced_vision = box / "drive" / "maya-models" / "Inkling-2-Mini-Abliterated-Strata" / "Inkling-2-Mini-Vision.strata"
+assert synced_vision.exists() and synced_vision.stat().st_size == new_vision.stat().st_size
+
+launch_cmd = ns["build_strata_launch_cmd"]("/content/strata-bin/strata", ns["MODEL_SPEC"]["strata"], models_dir / "strata-data", local_strata)
+assert "--family" in launch_cmd and launch_cmd[launch_cmd.index("--family") + 1] == "inkling-2-mini"
+assert "--model" in launch_cmd and launch_cmd[launch_cmd.index("--model") + 1] == "SQ-10"
+assert "--model-path" in launch_cmd and launch_cmd[launch_cmd.index("--model-path") + 1] == str(local_strata)
+assert "--drafting" in launch_cmd and launch_cmd[launch_cmd.index("--drafting") + 1] == "dspark"
+assert "--kv" in launch_cmd and launch_cmd[launch_cmd.index("--kv") + 1] == "fp8"
+assert "--parallel" in launch_cmd and launch_cmd[launch_cmd.index("--parallel") + 1] == "4"
+assert "--no-tui" in launch_cmd and "--restart" in launch_cmd
+
+src_cmd = ns["build_strata_source_setup_cmd"](pathlib.Path("/content/Strata/setup.sh"), ns["MODEL_SPEC"]["strata"], models_dir / "strata-data", local_strata)
+assert "--build" in src_cmd and "--gguf-dir" in src_cmd and str(local_strata) in src_cmd
+
+# Build & test expanded Project Maya runner (maya-inkling-2-mini + ablation default on)
+maya_cmd_sh = f"""
+export TMPDIR="{box}/tmp"
+export XDG_CONFIG_HOME="{box}/cfg"
+export COLABD_RUNTIME_DIR="{box}/rt"
+COLABD_LIB_DIR="{root}/lib"
+source "{root}/lib/core.sh"
+source "{root}/lib/env.sh"
+source "{root}/lib/auth.sh"
+source "{root}/lib/lifecycle.sh"
+load_config
+MODEL_PRESET="maya-inkling-2-mini"
+ENGINE_TYPE="auto"
+MAYA_ABLATION="on"
+MAYA_ABLATE_DEFAULT="on"
+EXPERT_RAM_POLICY="force_ram"
+CUSTOM_MODELS_DIR="{box}/work/maya-models"
+DRIVE_CACHE_DIR="{box}/drive/maya-models"
+build_remote_runner "local_nvme"
+echo "$RUNNER_PY"
+"""
+maya_runner = subprocess.check_output(["bash", "-c", maya_cmd_sh], text=True).strip().splitlines()[-1]
+py_compile.compile(maya_runner, doraise=True)
+
+ns_m = {"__name__": "unit_test_maya"}
+exec(compile(pathlib.Path(maya_runner).read_text(), maya_runner, "exec"), ns_m)
+assert ns_m["ENGINE_TYPE"] == "maya"
+m_args = ns_m["build_maya_cmd"](box / "work" / "maya-models", True, no_start=True)
+assert "--model" in m_args and m_args[m_args.index("--model") + 1] == "inkling-2-mini"
+assert "--ablation" in m_args and m_args[m_args.index("--ablation") + 1] == "on"
+assert "--no-start" in m_args
+
+maya_dir = box / "work" / "project-maya-ablate"
+maya_dir.mkdir(parents=True, exist_ok=True)
+ik2_cfg = maya_dir / "maya-ik2.json"
+ik2_cfg.write_text(json.dumps({"args": ["--model", "Inkling.gguf", "--ablate", "dir.gguf", "--ablate-default", "off"], "ablate": {"default": "off"}}))
+ns_m["patch_existing_maya_configs"](maya_dir, True)
+patched = json.loads(ik2_cfg.read_text())
+assert patched["args"][patched["args"].index("--ablate-default") + 1] == "on"
+assert patched["ablate"]["default"] == "on"
+assert "--mmap-experts" in patched["args"] and patched["args"][patched["args"].index("--mmap-experts") + 1] == "off"
+PYMULTI
 
 echo "ALL TESTS PASSED."

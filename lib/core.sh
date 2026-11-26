@@ -68,10 +68,19 @@ reset_defaults() {
   AUTO_ADOPT_EXTERNAL="1"                      # 1: auto-adopt pre-existing external login; 0 after explicit logout/remove
   AUTO_GCP_AUTH="0"                            # 1: run `colab auth` on session start
   GPU_TYPE="G4"                                # G4 (RTX PRO 6000 96GB) | H100 | A100 | L4 | T4
-  HIGH_MEM="1"                                 # 1: pass --high-mem, 0: standard RAM
-  MODEL_PRESET="ds4-abliterated-128g"          # Default uncensored Mix-128G
+  HIGH_MEM="1"                                 # 1: pass --high-mem, 0: standard RAM (required for Free T4)
+  ENGINE_TYPE="auto"                           # auto | strata | maya
+  MODEL_PRESET="ds4-abliterated-128g"          # Default uncensored Mix-128G (or switch to Free T4 Strata Inkling)
+  CUSTOM_HF_REPO=""                            # Custom HF repo for strata-custom-hf / maya-custom
+  CUSTOM_HF_FILE=""                            # Custom HF filename (.strata / .gguf) or Strata catalog model tag
+  CUSTOM_ENGINE_FAMILY="inkling-2-mini"        # Strata family or Maya custom --model/--ds4-quant spec
   MAYA_CONTEXT="65536"                         # 32768 | 65536 | 131072 | 262144
-  MAYA_DRAFTING="on"                           # on | off | measure
+  MAYA_DRAFTING="on"                           # on | off | measure (Strata: auto/dspark/off)
+  STRATA_KV_FORMAT="auto"                      # auto | int8 | fp8 | fp16 | q4_0
+  STRATA_PARALLEL="1"                          # 1..64 concurrent slots
+  STRATA_BUILD_FALLBACK="auto"                 # auto | prebuilt | source
+  MAYA_ABLATION="on"                           # on | off (--ablation flag for Project Maya)
+  MAYA_ABLATE_DEFAULT="off"                    # on | off (patch --ablate-default in maya-*.json)
 
   STORAGE_MODE="auto"                          # auto | nvme_engram | drive_engram | drive_full | local_nvme
   DRIVE_PREFETCH="1"                           # 1: search Google Drive shards first and pull to NVMe
@@ -107,9 +116,18 @@ save_config() {
       printf 'AUTO_GCP_AUTH=%q\n' "$AUTO_GCP_AUTH"
       printf 'GPU_TYPE=%q\n' "$GPU_TYPE"
       printf 'HIGH_MEM=%q\n' "$HIGH_MEM"
+      printf 'ENGINE_TYPE=%q\n' "$ENGINE_TYPE"
       printf 'MODEL_PRESET=%q\n' "$MODEL_PRESET"
+      printf 'CUSTOM_HF_REPO=%q\n' "$CUSTOM_HF_REPO"
+      printf 'CUSTOM_HF_FILE=%q\n' "$CUSTOM_HF_FILE"
+      printf 'CUSTOM_ENGINE_FAMILY=%q\n' "$CUSTOM_ENGINE_FAMILY"
       printf 'MAYA_CONTEXT=%q\n' "$MAYA_CONTEXT"
       printf 'MAYA_DRAFTING=%q\n' "$MAYA_DRAFTING"
+      printf 'STRATA_KV_FORMAT=%q\n' "$STRATA_KV_FORMAT"
+      printf 'STRATA_PARALLEL=%q\n' "$STRATA_PARALLEL"
+      printf 'STRATA_BUILD_FALLBACK=%q\n' "$STRATA_BUILD_FALLBACK"
+      printf 'MAYA_ABLATION=%q\n' "$MAYA_ABLATION"
+      printf 'MAYA_ABLATE_DEFAULT=%q\n' "$MAYA_ABLATE_DEFAULT"
       printf 'STORAGE_MODE=%q\n' "$STORAGE_MODE"
       printf 'DRIVE_PREFETCH=%q\n' "$DRIVE_PREFETCH"
       printf 'DRIVE_SAVE_POLICY=%q\n' "$DRIVE_SAVE_POLICY"
@@ -257,40 +275,133 @@ mask_secret() {
   fi
 }
 
-model_desc() {
-  case "$1" in
-    ds4-abliterated-128g) echo "DeepSeek-V4.1-Flash-1017 Uncensored Mix-128G (~114GB 权重 + 161GB Engram)" ;;
-    ds4-abliterated-256g) echo "DeepSeek-V4.1-Flash-1017 Uncensored Mix-256G (~236GB 权重 + 161GB Engram)" ;;
-    glm-maya-m-derisked)  echo "GLM-5.3-Flash 321B Maya-M-Derisked 去拒绝版 (~116GB, 无 Engram 外挂表)" ;;
-    glm-maya-xs)          echo "GLM-5.3-Flash 321B Maya-XS 轻量测试档 (~73.4GB)" ;;
-    inkling-2-mini)       echo "Inkling 2 Mini 26B 极速链路验证档 (~18.3GB)" ;;
-    *)                    echo "$1" ;;
+model_registry() {
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3 2>/dev/null || true)"
+  if [[ -z "$host_py" ]]; then
+    return 127
+  fi
+  COLABD_ENGINE_TYPE="${ENGINE_TYPE:-auto}" \
+    COLABD_CUSTOM_HF_REPO="${CUSTOM_HF_REPO:-}" \
+    COLABD_CUSTOM_HF_FILE="${CUSTOM_HF_FILE:-}" \
+    COLABD_CUSTOM_ENGINE_FAMILY="${CUSTOM_ENGINE_FAMILY:-}" \
+    "$host_py" "${COLABD_LIB_DIR}/model_registry.py" "$@"
+}
+
+resolve_effective_engine() {
+  local preset="${1:-$MODEL_PRESET}"
+  local out=""
+  out="$(model_registry field "$preset" engine 2>/dev/null || true)"
+  if [[ -n "$out" ]]; then
+    echo "$out"
+  elif [[ "$ENGINE_TYPE" == "strata" || "$ENGINE_TYPE" == "maya" ]]; then
+    echo "$ENGINE_TYPE"
+  else
+    echo "maya"
+  fi
+}
+
+engine_label() {
+  case "${1:-$(resolve_effective_engine)}" in
+    strata) echo "Strata (Niko1221/Strata)" ;;
+    maya)   echo "Project Maya (mw00/project-maya)" ;;
+    *)      echo "${1:-maya}" ;;
   esac
+}
+
+model_title() {
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" title 2>/dev/null || true)"
+  echo "${out:-$1}"
+}
+
+model_desc() {
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" desc 2>/dev/null || true)"
+  echo "${out:-$1}"
+}
+
+model_tier() {
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" tier 2>/dev/null || true)"
+  echo "${out:-custom}"
 }
 
 model_requires_hf_token() {
-  case "$1" in
-    ds4-abliterated-128g|ds4-abliterated-256g) return 0 ;;
-    *) return 1 ;;
-  esac
+  local flag=""
+  flag="$(model_registry field "${1:-$MODEL_PRESET}" requires_hf_token_flag 2>/dev/null || echo "0")"
+  [[ "$flag" == "1" ]]
+}
+
+model_hf_gated_url() {
+  model_registry field "${1:-$MODEL_PRESET}" hf_gated_url 2>/dev/null || true
 }
 
 model_has_engram() {
-  case "$1" in
-    ds4-abliterated-128g|ds4-abliterated-256g) return 0 ;;
-    *) return 1 ;;
-  esac
+  local flag=""
+  flag="$(model_registry field "${1:-$MODEL_PRESET}" has_engram_flag 2>/dev/null || echo "0")"
+  [[ "$flag" == "1" ]]
 }
 
 model_total_gb() {
-  case "$1" in
-    ds4-abliterated-128g) echo 285 ;;
-    ds4-abliterated-256g) echo 405 ;;
-    glm-maya-m-derisked)  echo 122 ;;
-    glm-maya-xs)          echo 78  ;;
-    inkling-2-mini)       echo 22  ;;
-    *)                    echo 120 ;;
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" disk_gb 2>/dev/null || true)"
+  if [[ "$out" =~ ^[0-9]+$ ]]; then
+    echo "$out"
+  else
+    echo 120
+  fi
+}
+
+model_recommended_gpu() {
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" recommended_gpu 2>/dev/null || true)"
+  echo "${out:-G4}"
+}
+
+model_recommended_high_mem() {
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" high_mem_flag 2>/dev/null || true)"
+  echo "${out:-1}"
+}
+
+model_recommended_context() {
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" recommended_context 2>/dev/null || true)"
+  echo "${out:-65536}"
+}
+
+model_recommended_storage() {
+  local out=""
+  out="$(model_registry field "${1:-$MODEL_PRESET}" recommended_storage 2>/dev/null || true)"
+  echo "${out:-auto}"
+}
+
+apply_recommended_hardware_for_preset() {
+  local preset="${1:-$MODEL_PRESET}"
+  GPU_TYPE="$(model_recommended_gpu "$preset")"
+  HIGH_MEM="$(model_recommended_high_mem "$preset")"
+  MAYA_CONTEXT="$(model_recommended_context "$preset")"
+  STORAGE_MODE="$(model_recommended_storage "$preset")"
+}
+
+strata_fallback_desc() {
+  case "${1:-$STRATA_BUILD_FALLBACK}" in
+    auto)     echo "智能选择 (驱动 >= 575.51 走官方预编译秒装，低驱动自动回退源码编译)" ;;
+    prebuilt) echo "仅官方预编译包 (极速免编译，要求 Colab 驱动 >= 575.51)" ;;
+    source)   echo "强制源码编译 (按当前节点 nvcc 原生架构编译，兼容旧驱动 T4)" ;;
+    *)        echo "$1" ;;
   esac
+}
+
+maya_ablation_desc() {
+  if [[ "${MAYA_ABLATION:-on}" != "on" ]]; then
+    echo "关闭 (--ablation off)"
+  elif [[ "${MAYA_ABLATE_DEFAULT:-off}" == "on" ]]; then
+    echo "全局默认开启 (--ablation on + --ablate-default on，所有请求默认去拒绝)"
+  else
+    echo "已加载向量 / 按请求开启 (--ablation on，默认 off，请求体传 ablate:true 触发)"
+  fi
 }
 
 storage_desc() {

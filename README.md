@@ -6,9 +6,9 @@
 
 English | [简体中文](README.zh-CN.md)
 
-The endgame for frontier LLM serving on Google Colab.
+The endgame for multi-engine frontier & free-tier LLM serving on Google Colab.
 
-`colabd` turns a disposable Google Colab GPU VM into a local-controlled frontier LLM server backed by [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) and [`mw00/project-maya`](https://github.com/mw00/project-maya). It runs 748B MoE models such as [`DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) and its uncensored [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF) builds on a single Colab Pro+ GPU, exposes authenticated OpenAI and Anthropic endpoints over Cloudflare or WebSocket SSH tunnels, and destroys the remote VM automatically the moment you exit.
+`colabd` turns a disposable Google Colab GPU VM — from a **Free T4 (16 GB)** to a **Pro+ G4 (96 GB Blackwell) / H100 / A100 / L4** — into a local-controlled LLM server backed by [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli), [`Niko1221/Strata`](https://github.com/Niko1221/Strata), and [`mw00/project-maya`](https://github.com/mw00/project-maya). It runs everything from **Free-tier uncensored `Inkling-2-Mini` (`SC117/Inkling-2-Mini-abliterated-Strata` SQ-10/15 & GGUFs)**, `Qwen3.8-Flash-Next`, `Qwen3.6-35B-A3B`, and `Tencent Hy4-Flash` to 300B–750B frontier MoE models (`DeepSeek-V4.1-Flash-1017`, `GLM-5.3 744B`, `GLM-5.3-Flash 321B`, `MiniMax-M3.1-Flash 428B`) and custom Hugging Face repositories, exposing authenticated OpenAI and Anthropic endpoints over Cloudflare or WebSocket SSH tunnels while automatically destroying the remote VM on exit.
 
 ## Why colabd exists
 
@@ -44,11 +44,31 @@ Google Colab GPU VM (e.g., G4 95.6 GB VRAM + 176.9 GB RAM + 235.7 GB Local NVMe)
         └── 5. Background atomic sync-back (`.syncing.tmp` -> Google Drive)
 ```
 
+## Supported engines & tiered model presets
+
+`colabd` ships a unified model registry (`lib/model_registry.py`) supporting **two engines** and **custom Hugging Face repos**:
+
+| Tier / Hardware | Engine | Representative Presets | Notes |
+| :--- | :--- | :--- | :--- |
+| **Free / Entry (`T4 16GB`, Std-RAM)** | `strata` | `strata-inkling-uncensored-sq10` *(Free T4 pick)*, `strata-inkling-uncensored-sq15`, `strata-inkling-uncensored-gguf`, `strata-inkling-sq10/15` | Uses [`SC117/Inkling-2-Mini-abliterated-Strata`](https://huggingface.co/SC117/Inkling-2-Mini-abliterated-Strata) (`.strata` v1.1 + DSpark + BF16 Vision) or `AtomicChat` GGUF. Prebuilt CUDA fast-path on drivers >= 575.51 with automatic source-build fallback on older Colab nodes; automatically omits `--high-mem`. |
+| **Free / Entry (`T4 16GB`)** | `maya` | `maya-inkling-2-mini` *(alias `inkling-2-mini`)* | Project Maya `maya-ik2` with built-in refusal ablation vector (`--ablation on`, optional `--ablate-default on`). |
+| **Mid-Range (`L4 24GB` / High-RAM)** | `strata` / `maya` | `strata-inkling-uncensored-sq20`, `strata-qwen36-q4`, `strata-qwen38-coder`, `strata-qwen38-gyro-s`, `strata-qwen38-q2`, `glm-maya-xs`, `glm-maya-s24`, `hy4-flash-maya-xs` | Covers 26B lossless, 35B MoE, Qwen3.8-Flash-Next Coder/Q2, GLM-5.3-Flash S24, and Tencent Hy4-Flash. |
+| **Flagship (`A100` / `G4` / `H100`)** | `maya` / `strata` | `ds4-abliterated-128g/256g`, `deepseek-maya-xs/s`, `glm-5.3-maya-xs` (744B), `glm-maya-m-derisked/l`, `minimax-maya-xs/s` (428B), `hy4-flash-maya-m/l`, `strata-qwen38-iq3s/unsloth-q4`, `strata-hy4-sq96` | Full three-tier VRAM/RAM/NVMe MoE serving with `nvme_engram` hybrid Drive routing. |
+| **Custom HF Repo / Quant** | `strata` / `maya` | `strata-custom-hf`, `maya-custom` | Point at any Hugging Face `.strata`, `.gguf`, safetensors repo, or upstream engine quant ID with Drive prefetch & atomic sync-back. |
+
+### Free-tier quick start (`T4` + Strata + Inkling-2-Mini Uncensored)
+
+```bash
+colabd auth login
+colabd use strata-inkling-uncensored-sq10   # Switches to Strata, T4, HIGH_MEM=0, local_nvme
+colabd up
+```
+
 ## Requirements
 
 - Linux or macOS with Bash 3.2+ (`colabd` automatically bootstraps its own isolated `uv` + Python 3.12 + [`google-colab-cli`](https://pypi.org/project/google-colab-cli/) runtime under `~/.local/share/colabd-runtime/venv`, with zero system Python 3.12 requirement).
-- A Google Colab Pro or Pro+ account for `G4`, `A100`, `H100`, or `L4` GPU runtimes.
-- For [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF): accept the gated repository terms on Hugging Face and generate an `HF_TOKEN`.
+- A **Google Colab Free** account (`T4` 16 GB standard RAM for Strata/Maya `Inkling-2-Mini` presets) **or** a Colab Pro / Pro+ account for `L4`, `A100`, `G4`, or `H100` runtimes.
+- For gated Hugging Face repositories such as [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF): accept the repository terms and provide an `HF_TOKEN`.
 
 ## Quick start
 
@@ -100,7 +120,12 @@ Configure both the runtime layout (`STORAGE_MODE`) and post-download write-back 
 
 ```bash
 colabd                         # Open the interactive TUI control panel
-colabd up                      # Allocate/start runtime immediately and attach TUI tether
+colabd up [--model ID] [--engine strata|maya] [--gpu T4|L4|A100|G4|H100] [--standard-mem|--high-mem]
+                               # Allocate/start runtime immediately and attach TUI tether
+colabd models [--tier free|mid|flagship|custom] [--engine strata|maya]
+                               # List built-in presets grouped by hardware tier & engine
+colabd use <preset-id> [--engine strata|maya] [--keep-hw]
+                               # Switch active preset and auto-apply recommended GPU/RAM settings
 colabd auth                    # Open account management, scope check & GCP auth center
 colabd auth list               # List logged-in accounts (deduped by email), scope status & sessions
 colabd auth login              # Log in a Google account (auto-dedup + strict scope check, --oauth2 / --adc)
@@ -132,8 +157,9 @@ make test
 ## Acknowledgments
 
 - [`googlecolab/google-colab-cli`](https://github.com/googlecolab/google-colab-cli) for official terminal runtime provisioning, `colab exec`, and WebSocket SSH proxy support.
-- [`mw00/project-maya`](https://github.com/mw00/project-maya) by Peasant Smith and contributors for the three-tier VRAM/RAM/NVMe MoE inference engine.
-- [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF) and [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) for open model weights.
+- [`Niko1221/Strata`](https://github.com/Niko1221/Strata) for the consumer-hardware MoE & `strata-inkling` inference engine with prebuilt CUDA binaries and OpenAI/Anthropic APIs.
+- [`mw00/project-maya`](https://github.com/mw00/project-maya) by Peasant Smith and contributors for the three-tier VRAM/RAM/NVMe frontier MoE inference engine.
+- [`SC117/Inkling-2-Mini-abliterated-Strata`](https://huggingface.co/SC117/Inkling-2-Mini-abliterated-Strata), [`OpenUncensored/Inkling-2-Mini-Uncensored`](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored), [`AtomicChat/Inkling-2-Mini-Uncensored-GGUF`](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF), [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF), and [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) for open model weights.
 - [`cloudflare/cloudflared`](https://github.com/cloudflare/cloudflared) for Quick and Zero Trust HTTPS tunnels.
 
 ## License

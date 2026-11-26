@@ -837,23 +837,40 @@ build_remote_runner() {
   local effective_storage="$1"
   local host_py=""
   host_py="$(resolve_host_python 2>/dev/null || command -v python3)"
+  local eff_engine=""
+  eff_engine="$(resolve_effective_engine "$MODEL_PRESET")"
+  local spec_json=""
+  spec_json="$(model_registry resolve "$MODEL_PRESET" 2>/dev/null || echo "{}")"
+
   "$host_py" - \
-    "$MODEL_PRESET" "$MAYA_CONTEXT" "$MAYA_DRAFTING" "$MAYA_PORT" \
+    "$eff_engine" "$MODEL_PRESET" "$spec_json" \
+    "$MAYA_CONTEXT" "$MAYA_DRAFTING" "$MAYA_PORT" \
+    "$STRATA_KV_FORMAT" "$STRATA_PARALLEL" "$STRATA_BUILD_FALLBACK" \
+    "$MAYA_ABLATION" "$MAYA_ABLATE_DEFAULT" \
     "$effective_storage" "$DRIVE_PREFETCH" "$DRIVE_SAVE_POLICY" "$EXPERT_RAM_POLICY" \
     "$CUSTOM_MODELS_DIR" "$DRIVE_CACHE_DIR" \
     "$TUNNEL_MODE" "$CF_TUNNEL_TOKEN" "$CF_PUBLIC_HOSTNAME" \
     "$HF_TOKEN" "$MAYA_API_KEY" "$NO_VISION" "$WEB_UI" "$LOCAL_BIND" \
     > "$RUNNER_PY" <<'PYCFG'
+import json
 import sys
 
 keys = [
-    "model_preset", "maya_context", "maya_drafting", "maya_port",
+    "engine_type", "model_preset", "model_spec_json",
+    "maya_context", "maya_drafting", "maya_port",
+    "strata_kv_format", "strata_parallel", "strata_build_fallback",
+    "maya_ablation", "maya_ablate_default",
     "storage_mode", "drive_prefetch", "drive_save_policy", "expert_ram_policy",
     "custom_models_dir", "drive_cache_dir",
     "tunnel_mode", "cf_tunnel_token", "cf_public_hostname",
     "hf_token", "maya_api_key", "no_vision", "web_ui", "local_bind",
 ]
 cfg = dict(zip(keys, sys.argv[1:]))
+raw_spec = cfg.pop("model_spec_json", "{}")
+try:
+    cfg["model_spec"] = json.loads(raw_spec) if raw_spec else {}
+except Exception:
+    cfg["model_spec"] = {}
 print(f"CONFIG = {repr(cfg)}\n")
 PYCFG
 
@@ -899,6 +916,18 @@ validate_runtime_settings() {
     echo "${C_RED}[配置错误] LOCAL_BIND '${LOCAL_BIND}' 含非法字符，请进设置页 [10] 修改。${C_RESET}"
     return 1
   fi
+  if [[ ! "${STRATA_PARALLEL:-1}" =~ ^[0-9]+$ || "${STRATA_PARALLEL:-1}" -lt 1 || "${STRATA_PARALLEL:-1}" -gt 64 ]]; then
+    echo "${C_RED}[配置错误] STRATA_PARALLEL '${STRATA_PARALLEL}' 无效（需为 1-64），请进设置页 [5] 修改。${C_RESET}"
+    return 1
+  fi
+  if [[ "$MODEL_PRESET" == "strata-custom-hf" && -z "$CUSTOM_HF_REPO" && -z "$CUSTOM_HF_FILE" ]]; then
+    echo "${C_RED}[配置错误] 当前为 Strata 自定义模型预设，但尚未填写 Hugging Face 仓库或官方目录量化名，请进设置页 [1] 配置。${C_RESET}"
+    return 1
+  fi
+  if [[ "$MODEL_PRESET" == "maya-custom" && -z "$CUSTOM_ENGINE_FAMILY" && -z "$CUSTOM_HF_REPO" ]]; then
+    echo "${C_RED}[配置错误] 当前为 Project Maya 自定义模型预设，但尚未填写模型参数或 Hugging Face 仓库，请进设置页 [1] 配置。${C_RESET}"
+    return 1
+  fi
   return 0
 }
 
@@ -913,10 +942,17 @@ action_start_or_restart() {
     return
   fi
 
+  local eff_engine=""
+  eff_engine="$(resolve_effective_engine "$MODEL_PRESET")"
+
   if model_requires_hf_token "$MODEL_PRESET" && [[ -z "$HF_TOKEN" ]]; then
+    local gated_url=""
+    gated_url="$(model_hf_gated_url "$MODEL_PRESET")"
     echo ""
-    echo "${C_YELLOW}[提示] 当前选择的 '${MODEL_PRESET}' 来自受限仓库 (orcarouter Abliterated GGUF)。${C_RESET}"
-    echo "请先确保已在浏览器同意协议: https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF"
+    echo "${C_YELLOW}[提示] 当前选择的 '${MODEL_PRESET}' 来自受限 Hugging Face 仓库。${C_RESET}"
+    if [[ -n "$gated_url" ]]; then
+      echo "请先确保已在浏览器同意协议: ${gated_url}"
+    fi
     read -r -s -p "请输入你的 Hugging Face Token (hf_...，直接回车取消启动): " input_hf
     echo ""
     if [[ -z "$input_hf" ]]; then
@@ -985,16 +1021,28 @@ action_start_or_restart() {
   else
     local new_args=(new -s "$SESSION_NAME" --gpu "$GPU_TYPE")
     [[ "$HIGH_MEM" == "1" ]] && new_args+=(--high-mem)
-    echo "${C_CYAN}[分配] 正在以账号 '$(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")' 申请 Colab GPU 实例 (${GPU_TYPE})...${C_RESET}"
+    echo "${C_CYAN}[分配] 正在以账号 '$(format_account_label "$ACTIVE_ACCOUNT" "$COLAB_AUTH_MODE" "$AUTH_NOTE")' 申请 Colab GPU 实例 (${GPU_TYPE}$( [[ "$HIGH_MEM" == "1" ]] && echo " High-RAM" || echo " Standard-RAM" )) | 引擎: $(engine_label "$eff_engine")...${C_RESET}"
     if ! colab_cli "${new_args[@]}"; then
-      echo "${C_RED}[失败] Colab 实例分配失败（可能是当前 GPU 规格库存紧张、配额不足或权限域不完整）。${C_RESET}"
-      MANAGED_SESSION=0
-      ACTIVE_SESSION_NAME=""
-      ACTIVE_SESSION_ACCOUNT=""
-      ACTIVE_SESSION_AUTH_MODE=""
-      ACTIVE_SESSION_HAS_OWNER=0
-      read -r -p "按回车返回主菜单..." _
-      return
+      local alloc_ok=0
+      if [[ "$GPU_TYPE" == "T4" && "$HIGH_MEM" == "1" ]]; then
+        echo "${C_YELLOW}[Free 降级重试] T4 高内存 (--high-mem) 申请失败（Colab Free 免费号仅支持标准内存 T4），正在自动去掉 --high-mem 重试...${C_RESET}"
+        if colab_cli new -s "$SESSION_NAME" --gpu T4; then
+          HIGH_MEM="0"
+          save_config
+          alloc_ok=1
+          echo "${C_GREEN}[已降级] 已成功申请标准内存 T4 实例，并自动关闭配置中的 HIGH_MEM。${C_RESET}"
+        fi
+      fi
+      if [[ "$alloc_ok" -ne 1 ]]; then
+        echo "${C_RED}[失败] Colab 实例分配失败（可能是当前 GPU 规格库存紧张、Free 账号不支持该显卡/高内存，或权限域不完整）。${C_RESET}"
+        MANAGED_SESSION=0
+        ACTIVE_SESSION_NAME=""
+        ACTIVE_SESSION_ACCOUNT=""
+        ACTIVE_SESSION_AUTH_MODE=""
+        ACTIVE_SESSION_HAS_OWNER=0
+        read -r -p "按回车返回主菜单..." _
+        return
+      fi
     fi
     created_fresh_vm=1
   fi

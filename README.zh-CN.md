@@ -8,7 +8,7 @@
 
 The endgame for frontier LLM serving on Google Colab.
 
-`colabd` 基于官方 [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli) 与 [`mw00/project-maya`](https://github.com/mw00/project-maya)，在本地 Linux 或 macOS 终端将 Google Colab GPU 实例托管为受生命周期绑定的大模型推理服务端。默认适配 [`DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) 的去审查版本 [`orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF`](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF)，支持通过 Cloudflare 或官方 WebSocket SSH 暴露带鉴权的 OpenAI 与 Anthropic 兼容接口，并在退出面板或按下 `Ctrl+C` 时自动执行 `colab stop` 销毁实例。
+`colabd` 基于官方 [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli)，统一整合 **[`Niko1221/Strata`](https://github.com/Niko1221/Strata)** 与 **[`mw00/project-maya`](https://github.com/mw00/project-maya)** 双推理引擎，在本地 Linux 或 macOS 终端将 Google Colab GPU 实例（从 **Free 免费号 T4 16GB** 到 **Pro+ G4 96GB / H100 / A100 / L4**）托管为受生命周期绑定的大模型推理服务端。支持 Free 号开箱即跑去审查版 **Inkling 2 Mini**（[`SC117/Inkling-2-Mini-abliterated-Strata`](https://huggingface.co/SC117/Inkling-2-Mini-abliterated-Strata) `SQ-10/15` 与社区 GGUF）、`Qwen3.8-Flash-Next`、`Qwen3.6-35B-A3B`、`Tencent Hy4-Flash`，以及旗舰级 `DeepSeek-V4.1-Flash-1017`（748B）、`GLM-5.3`（744B / 321B）、`MiniMax-M3.1-Flash`（428B）与任意自定义 Hugging Face 仓库，通过 Cloudflare 或官方 WebSocket SSH 暴露带鉴权的 OpenAI 与 Anthropic 兼容接口，并在退出面板或按下 `Ctrl+C` 时自动执行 `colab stop` 销毁实例。
 
 ## 解决的核心工程痛点
 
@@ -52,6 +52,26 @@ colabd
 3. 按 `1` 启动实例，在菜单 `2`（状态监控页）查看 GPU/内存遥测、云盘回存进度与 `colab usage` 算力余额，在菜单 `3` 查看实时构建日志。
 4. 使用完按 `0` 或直接 `Ctrl+C`，面板会自动清理本地隧道并执行 `colab stop` 释放算力。
 
+## 支持的双引擎与分级模型预设
+
+通过统一注册表 `lib/model_registry.py`，内置按硬件规格分组的精选预设并支持自定义 Hugging Face 仓库：
+
+| 硬件层级 | 引擎 | 代表预设 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **Free / 入门卡 (`T4 16GB`, 标准内存)** | `strata` | `strata-inkling-uncensored-sq10` *(Free T4 首选)*、`strata-inkling-uncensored-sq15`、`strata-inkling-uncensored-gguf`、`strata-inkling-sq10/15` | 原生 `.strata` v1.1 去审查版（`SC117`）与 `AtomicChat` GGUF，支持驱动 `>= 575.51` 官方预编译秒装 / 旧驱动自动源码回退，自动关闭 `--high-mem` 并在误开时降级重试 |
+| **Free / 入门卡 (`T4 16GB`)** | `maya` | `maya-inkling-2-mini` *(兼容旧名 `inkling-2-mini`)* | Project Maya 原生运行，支持 `--ablation on` 及可选 `--ablate-default on` 全局默认去拒绝 |
+| **中端卡 (`L4 24GB` / High-RAM)** | `strata` / `maya` | `strata-inkling-uncensored-sq20`、`strata-qwen36-q4`、`strata-qwen38-coder`、`strata-qwen38-gyro-s`、`strata-qwen38-q2`、`glm-maya-xs`、`glm-maya-s24`、`hy4-flash-maya-xs` | 覆盖无损 Inkling、Qwen3.6 35B、Qwen3.8 代码/高速版、GLM-S24 与腾讯 Hy4-Flash |
+| **旗舰卡 (`A100` / `G4` / `H100`)** | `maya` / `strata` | `ds4-abliterated-128g/256g`、`deepseek-maya-xs/s`、`glm-5.3-maya-xs` (744B)、`glm-maya-m-derisked/l`、`minimax-maya-xs/s` (428B)、`hy4-flash-maya-m/l`、`strata-qwen38-iq3s/unsloth-q4`、`strata-hy4-sq96` | 300B–750B 旗舰三层内存 MoE 与 `nvme_engram` 反向跨盘缓存 |
+| **自定义 HF 仓库 / 量化** | `strata` / `maya` | `strata-custom-hf`、`maya-custom` | 自定义 HF Repo + `.strata`/`.gguf` 文件或上游模型参数，同样享有云盘预拉取与原子回存 |
+
+### Free 免费号一键上手（`T4` + Strata + Inkling 2 Mini Uncensored）
+
+```bash
+colabd auth login
+colabd use strata-inkling-uncensored-sq10   # 自动切至 Strata、T4、关闭 --high-mem、local_nvme
+colabd up
+```
+
 ## 存储拓扑与云盘策略对照
 
 | 存储模式 (`STORAGE_MODE`) | 运行期文件分布 | 适用硬件与云盘条件 |
@@ -72,7 +92,12 @@ colabd
 
 ```bash
 colabd                         # 启动交互式数字菜单控制台 (默认)
-colabd up                      # 直接拉起配置的 Colab 实例并进入控制台保活
+colabd up [--model ID] [--engine strata|maya] [--gpu T4|L4|A100|G4|H100] [--standard-mem|--high-mem]
+                               # 直接拉起配置的 Colab 实例并进入控制台保活 (支持命令行快速覆盖)
+colabd models [--tier free|mid|flagship|custom] [--engine strata|maya]
+                               # 按硬件层级查看全部内置模型与引擎预设
+colabd use <preset-id> [--engine strata|maya] [--keep-hw]
+                               # 一键切换模型预设并自动匹配推荐 GPU / High-RAM 规格
 colabd auth                    # 打开账号管理、权限域校验与远端 GCP 授权中心
 colabd auth list               # 按唯一账号 ID (邮箱) 查看已登录账号、权限状态与活跃实例
 colabd auth login              # 登录新账号 (自动按邮箱去重 + 校验必需 Scopes，支持 --oauth2 / --adc)

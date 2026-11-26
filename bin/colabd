@@ -44,7 +44,12 @@ The endgame for frontier LLM serving on Google Colab.
 
 Usage:
   colabd                                  Launch the interactive TUI control panel (default)
-  colabd up                               Start the configured Colab runtime and enter the TUI tether
+  colabd up [--model ID] [--engine strata|maya] [--gpu GPU] [--standard-mem|--high-mem]
+                                          Start the configured Colab runtime and enter the TUI tether
+  colabd models [--tier free|mid|flagship|custom] [--engine strata|maya]
+                                          List built-in model presets grouped by hardware tier
+  colabd use <preset-id> [--engine strata|maya] [--keep-hw]
+                                          Switch active model preset (auto-applies recommended GPU/RAM)
   colabd auth                             Open the interactive account management & GCP auth center
   colabd auth list                        List logged-in accounts (deduped by email), scope status & sessions
   colabd auth whoami                      Show active account ID, granted scopes, sessions & compute usage
@@ -342,9 +347,186 @@ handle_env_cli() {
   esac
 }
 
+handle_models_cli() {
+  local tier_filter=""
+  local engine_filter=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      list|ls)
+        ;;
+      --tier|-t)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing tier after $1 (free|mid|flagship|custom)" >&2
+          return 1
+        fi
+        tier_filter="$2"
+        shift
+        ;;
+      --tier=*)
+        tier_filter="${1#--tier=}"
+        ;;
+      --engine|-e)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing engine after $1 (strata|maya)" >&2
+          return 1
+        fi
+        engine_filter="$2"
+        shift
+        ;;
+      --engine=*)
+        engine_filter="${1#--engine=}"
+        ;;
+      *)
+        echo "[ERROR] Unknown option for 'colabd models': $1" >&2
+        return 1
+        ;;
+    esac
+    shift
+  done
+
+  echo "colabd 内置模型与引擎预设 (Strata + Project Maya):"
+  local args=(table)
+  [[ -n "$tier_filter" ]] && args+=(--tier "$tier_filter")
+  [[ -n "$engine_filter" ]] && args+=(--engine "$engine_filter")
+  model_registry "${args[@]}"
+  echo ""
+  echo "使用 'colabd use <preset-id>' 一键切换预设并自动匹配推荐 GPU/内存规格。"
+  return 0
+}
+
+handle_use_cli() {
+  local target=""
+  local eng_ov=""
+  local keep_hw=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-hw)
+        keep_hw=1
+        ;;
+      --engine|-e)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing engine after $1 (strata|maya|auto)" >&2
+          return 1
+        fi
+        eng_ov="$2"
+        shift
+        ;;
+      --engine=*)
+        eng_ov="${1#--engine=}"
+        ;;
+      -*)
+        echo "[ERROR] Unknown option for 'colabd use': $1" >&2
+        return 1
+        ;;
+      *)
+        target="$1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$target" ]]; then
+    echo "[ERROR] Usage: colabd use <preset-id> [--engine strata|maya|auto] [--keep-hw]" >&2
+    return 1
+  fi
+
+  local resolved=""
+  if ! resolved="$(model_registry exists "$target" 2>/dev/null)"; then
+    echo "[ERROR] 未知预设 '${target}'。运行 'colabd models' 查看全部可用预设 ID。" >&2
+    return 1
+  fi
+
+  if [[ -n "$eng_ov" ]]; then
+    case "$eng_ov" in
+      auto|strata|maya) ENGINE_TYPE="$eng_ov" ;;
+      *)
+        echo "[ERROR] 无效引擎 '${eng_ov}' (可选: auto | strata | maya)。" >&2
+        return 1
+        ;;
+    esac
+  else
+    ENGINE_TYPE="auto"
+  fi
+
+  MODEL_PRESET="$resolved"
+  if [[ "$keep_hw" -eq 0 ]]; then
+    apply_recommended_hardware_for_preset "$MODEL_PRESET"
+  fi
+  save_config
+
+  local eff_eng=""
+  eff_eng="$(resolve_effective_engine "$MODEL_PRESET")"
+  echo "${C_GREEN}[已切换] 模型预设: ${MODEL_PRESET}${C_RESET}"
+  echo "  推理引擎 : $(engine_label "$eff_eng")"
+  echo "  模型说明 : $(model_desc "$MODEL_PRESET")"
+  echo "  硬件配置 : GPU=${GPU_TYPE} | High-RAM=$( [[ "$HIGH_MEM" == "1" ]] && echo "开启" || echo "关闭 (Free 兼容)" ) | 上下文=${MAYA_CONTEXT} | 存储=${STORAGE_MODE}"
+  return 0
+}
+
+handle_up_args() {
+  local changed=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model|-m)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing preset ID after $1" >&2
+          return 1
+        fi
+        local resolved=""
+        if resolved="$(model_registry exists "$2" 2>/dev/null)"; then
+          MODEL_PRESET="$resolved"
+          ENGINE_TYPE="auto"
+          apply_recommended_hardware_for_preset "$MODEL_PRESET"
+        else
+          MODEL_PRESET="$2"
+        fi
+        changed=1
+        shift
+        ;;
+      --engine|-e)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing engine after $1 (auto|strata|maya)" >&2
+          return 1
+        fi
+        case "$2" in
+          auto|strata|maya) ENGINE_TYPE="$2"; changed=1 ;;
+          *) echo "[ERROR] Invalid engine '$2' (expected auto|strata|maya)" >&2; return 1 ;;
+        esac
+        shift
+        ;;
+      --gpu|-g)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing GPU type after $1 (T4|L4|A100|G4|H100)" >&2
+          return 1
+        fi
+        GPU_TYPE="$2"
+        changed=1
+        shift
+        ;;
+      --high-mem)
+        HIGH_MEM="1"
+        changed=1
+        ;;
+      --standard-mem|--no-high-mem)
+        HIGH_MEM="0"
+        changed=1
+        ;;
+      *)
+        echo "[ERROR] Unknown option for 'colabd up': $1" >&2
+        return 1
+        ;;
+    esac
+    shift
+  done
+  if [[ "$changed" -eq 1 ]]; then
+    save_config
+  fi
+  return 0
+}
+
 main() {
   local sub="${1:-}"
-  # Handle pure informational commands BEFORE load_config so --help / --version never write config.env!
+  # Handle pure informational commands BEFORE load_config so --help / --version / models never write config.env!
   case "$sub" in
     -h|--help|help)
       COLABD_SKIP_AUTO_STOP=1
@@ -356,13 +538,30 @@ main() {
       echo "colabd ${COLABD_VERSION}"
       exit 0
       ;;
+    models)
+      COLABD_SKIP_AUTO_STOP=1
+      shift
+      handle_models_cli "$@"
+      exit $?
+      ;;
   esac
 
   load_config
   case "$sub" in
     up)
+      shift
+      if ! handle_up_args "$@"; then
+        COLABD_SKIP_AUTO_STOP=1
+        exit 1
+      fi
       action_start_or_restart
       run_interactive_loop
+      ;;
+    use)
+      COLABD_SKIP_AUTO_STOP=1
+      shift
+      handle_use_cli "$@"
+      exit $?
       ;;
     auth)
       COLABD_SKIP_AUTO_STOP=1

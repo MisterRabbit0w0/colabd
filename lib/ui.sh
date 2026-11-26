@@ -113,13 +113,45 @@ page_account_auth() {
   done
 }
 
+probe_endpoint_health() {
+  local ep="$1"
+  local body=""
+  if ! body="$(curl -fsS --max-time 3 -H "Authorization: Bearer ${MAYA_API_KEY}" "${ep}/health" 2>/dev/null)"; then
+    echo "unreachable"
+    return 1
+  fi
+  local host_py=""
+  host_py="$(resolve_host_python 2>/dev/null || command -v python3 2>/dev/null || true)"
+  if [[ -n "$host_py" && -n "$body" ]]; then
+    "$host_py" - "$body" <<'PYH' 2>/dev/null || echo "ready"
+import json, sys
+raw = sys.argv[1].strip()
+if raw.startswith("{"):
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "loaded" in data:
+            print("ready" if bool(data.get("loaded")) else "loading")
+            sys.exit(0)
+    except Exception:
+        pass
+print("ready")
+PYH
+    return 0
+  fi
+  echo "ready"
+  return 0
+}
+
 page_status() {
   refresh_colab_auth_status 4 0 || true
   while true; do
     clear 2>/dev/null || true
-    local phase gpu ram_gb local_free drive_free models_dir api_ok ep ram_res sync_st sync_msg
+    local phase gpu drv_ver ram_gb local_free drive_free models_dir api_ok ep ram_res sync_st sync_msg eng_telem eff_eng
     phase="$(read_telemetry_field phase)"
+    eng_telem="$(read_telemetry_field engine)"
+    eff_eng="${eng_telem:-$(resolve_effective_engine "$MODEL_PRESET")}"
     gpu="$(read_telemetry_field gpu)"
+    drv_ver="$(read_telemetry_field driver_version)"
     ram_gb="$(read_telemetry_field ram_gb)"
     local_free="$(read_telemetry_field local_free_gb)"
     drive_free="$(read_telemetry_field drive_free_gb)"
@@ -137,9 +169,15 @@ page_status() {
     else
       echo "  守护进程状态 : ${C_YELLOW}未运行${C_RESET} (预设会话: ${SESSION_NAME})"
     fi
+    echo "  引擎与模型   : ${C_BOLD}$(engine_label "$eff_eng")${C_RESET}  |  ${MODEL_PRESET}"
     echo "  当前执行阶段 : ${phase:-尚未启动}"
-    echo "  远端硬件信息 : GPU=${gpu:-未知} | 系统RAM=${ram_gb:-0} GiB"
-    echo "  专家内存常驻 : $( [[ "$ram_res" == "True" || "$ram_res" == "true" ]] && echo "${C_GREEN}已激活 (--mmap-experts off，零专家交换)${C_RESET}" || echo "默认按需映射 (${EXPERT_RAM_POLICY})" )"
+    echo "  远端硬件信息 : GPU=${gpu:-未知}$( [[ -n "$drv_ver" ]] && echo " | Driver=${drv_ver}" ) | 系统RAM=${ram_gb:-0} GiB"
+    if [[ "$eff_eng" == "strata" ]]; then
+      echo "  Strata 参数  : KV=${STRATA_KV_FORMAT} | 并发=${STRATA_PARALLEL} | 驱动构建策略=${STRATA_BUILD_FALLBACK} | 投机解码=${MAYA_DRAFTING}"
+    else
+      echo "  专家内存常驻 : $( [[ "$ram_res" == "True" || "$ram_res" == "true" ]] && echo "${C_GREEN}已激活 (--mmap-experts off，零专家交换)${C_RESET}" || echo "默认按需映射 (${EXPERT_RAM_POLICY})" )"
+      echo "  Maya 消融态  : $(maya_ablation_desc)"
+    fi
     echo "  远端磁盘余量 : 本地 /content 剩余 ${local_free:-未知} GiB | 云盘剩余 ${drive_free:-未挂载} GiB"
     echo "  工作目录拓扑 : ${models_dir:-尚未挂载} (模式: ${STORAGE_MODE})"
     echo "  云盘分片回存 : ${sync_msg:-等待模型就绪后检查} (${sync_st:-idle} | 策略: ${DRIVE_SAVE_POLICY})"
@@ -154,12 +192,16 @@ page_status() {
     echo "  API Key      : ${MAYA_API_KEY}"
 
     if [[ -n "$ep" && "$ep" != *"<"* ]]; then
-      if curl -fsS --max-time 3 -H "Authorization: Bearer ${MAYA_API_KEY}" "${ep}/health" >/dev/null 2>&1; then
+      local hstate=""
+      hstate="$(probe_endpoint_health "$ep" || true)"
+      if [[ "$hstate" == "ready" ]]; then
         echo "  实时健康探测 : ${C_GREEN}HTTP 200 在线可用 (模型已加载完毕)${C_RESET}"
+      elif [[ "$hstate" == "loading" ]]; then
+        echo "  实时健康探测 : ${C_YELLOW}引擎 HTTP 已启动，模型权重正在加载入显存中...${C_RESET}"
       elif [[ "$api_ok" == "True" || "$api_ok" == "true" ]]; then
         echo "  实时健康探测 : ${C_YELLOW}远端引擎已就绪，隧道连接建立中...${C_RESET}"
       else
-        echo "  实时健康探测 : ${C_YELLOW}正在拉取分片/下载/编译预热中 (可按 l 查看实时进度)${C_RESET}"
+        echo "  实时健康探测 : ${C_YELLOW}正在拉取分片/下载/初始化引擎中 (可按 l 查看实时进度)${C_RESET}"
       fi
     fi
 
@@ -231,21 +273,303 @@ action_test_request() {
   read -r -p "按回车继续..." _
 }
 
+prompt_sync_recommended_hw() {
+  local preset="$1"
+  local rec_gpu="" rec_hm="" rec_ctx="" rec_st=""
+  rec_gpu="$(model_recommended_gpu "$preset")"
+  rec_hm="$(model_recommended_high_mem "$preset")"
+  rec_ctx="$(model_recommended_context "$preset")"
+  rec_st="$(model_recommended_storage "$preset")"
+  local hm_txt="关闭 (Free 兼容)"
+  [[ "$rec_hm" == "1" ]] && hm_txt="开启 (--high-mem)"
+  echo ""
+  echo "该预设推荐硬件参数: GPU=${C_GREEN}${rec_gpu}${C_RESET} | High-RAM=${C_GREEN}${hm_txt}${C_RESET} | 上下文=${rec_ctx} | 存储=${rec_st}"
+  read -r -p "是否同步应用推荐硬件配置? [Y/n]: " sync_hw
+  if [[ ! "${sync_hw:-Y}" =~ ^[Nn]$ ]]; then
+    GPU_TYPE="$rec_gpu"
+    HIGH_MEM="$rec_hm"
+    MAYA_CONTEXT="$rec_ctx"
+    STORAGE_MODE="$rec_st"
+  fi
+}
+
+select_preset_from_tier() {
+  local tier_id="$1"
+  local tier_title="$2"
+  local rows=""
+  rows="$(model_registry list --tier "$tier_id" 2>/dev/null || true)"
+  if [[ -z "$rows" ]]; then
+    echo "${C_YELLOW}[提示] 该分组暂无内置预设。${C_RESET}"
+    sleep 1
+    return 1
+  fi
+
+  local ids=()
+  local idx=0
+  local pid peng pdesc pgpu phm pdisk ptok
+  echo ""
+  echo "${C_BOLD}${C_CYAN}--- ${tier_title} ---${C_RESET}"
+  while IFS="$FIELD_SEP" read -r pid peng _ _ pdesc pgpu phm pdisk _ ptok; do
+    [[ -z "$pid" ]] && continue
+    idx=$((idx + 1))
+    ids+=("$pid")
+    local mark=" "
+    [[ "$pid" == "$MODEL_PRESET" ]] && mark="*"
+    local hw_tag="${pgpu} Std-RAM"
+    if [[ "$phm" == "1" ]]; then
+      hw_tag="${pgpu} High-RAM"
+    fi
+    local tok_tag=""
+    [[ "$ptok" == "1" ]] && tok_tag=" ${C_YELLOW}[需HF_TOKEN]${C_RESET}"
+    printf " %s%2d) %-32s [%s | %s | ~%sGB]%s\n" "$mark" "$idx" "$pid" "$peng" "$hw_tag" "$pdisk" "$tok_tag"
+    echo "      ${C_DIM}${pdesc}${C_RESET}"
+  done <<< "$rows"
+
+  echo "   0) 返回"
+  read -r -p "请选择预设编号 [0-${idx}]: " pick
+  if [[ -z "$pick" || "$pick" == "0" ]]; then
+    return 1
+  fi
+  if [[ "$pick" =~ ^[0-9]+$ && "$pick" -ge 1 && "$pick" -le "$idx" ]]; then
+    local chosen="${ids[$((pick - 1))]}"
+    MODEL_PRESET="$chosen"
+    ENGINE_TYPE="auto"
+    prompt_sync_recommended_hw "$MODEL_PRESET"
+    save_config
+    return 0
+  fi
+  echo "${C_RED}[无效编号] ${pick}${C_RESET}"
+  sleep 1
+  return 1
+}
+
+configure_custom_model_interactive() {
+  echo ""
+  echo "${C_BOLD}${C_CYAN}--- 自定义 Hugging Face 仓库 / 量化模型 ---${C_RESET}"
+  echo "  1) Strata 引擎自定义 HF 模型 (.strata / .gguf / Safetensors，或 Strata 官方目录量化)"
+  echo "  2) Project Maya 引擎自定义模型 ID / HF 仓库 (--model / --ds4-quant / --model-dir)"
+  echo "  0) 返回"
+  read -r -p "选择引擎 [1-2，回车取消]: " c_eng
+  case "${c_eng:-0}" in
+    1)
+      echo ""
+      echo "选择 Strata 模型家族:"
+      echo "  1) inkling-2-mini  (Inkling 2 Mini .strata / GGUF，推荐 Free T4)"
+      echo "  2) qwen            (Qwen3.8-Flash-Next ISTA-DASLab / GGUF)"
+      echo "  3) qwen36          (Qwen3.6-35B-A3B)"
+      echo "  4) hy4-flash       (Tencent Hy4-Flash)"
+      echo "  5) unsloth         (Qwen3.8-Flash-Next Unsloth)"
+      echo "  6) gyro            (Qwen3.8-Flash-Next Gyro)"
+      read -r -p "选择家族 [1-6，回车保持 ${CUSTOM_ENGINE_FAMILY:-inkling-2-mini}]: " f_idx
+      case "$f_idx" in
+        1) CUSTOM_ENGINE_FAMILY="inkling-2-mini" ;;
+        2) CUSTOM_ENGINE_FAMILY="qwen" ;;
+        3) CUSTOM_ENGINE_FAMILY="qwen36" ;;
+        4) CUSTOM_ENGINE_FAMILY="hy4-flash" ;;
+        5) CUSTOM_ENGINE_FAMILY="unsloth" ;;
+        6) CUSTOM_ENGINE_FAMILY="gyro" ;;
+      esac
+      echo ""
+      echo "示例 HF 仓库: SC117/Inkling-2-Mini-abliterated-Strata 或 AtomicChat/Inkling-2-Mini-Uncensored-GGUF"
+      echo "(若留空 HF 仓库，则直接按 Strata 官方目录 --family + --model 量化名拉取)"
+      read -r -p "Hugging Face 仓库 (org/repo，输入 CLEAR 清空) [当前: ${CUSTOM_HF_REPO}]: " in_repo
+      if [[ "$in_repo" == "CLEAR" ]]; then
+        CUSTOM_HF_REPO=""
+      elif [[ -n "$in_repo" ]]; then
+        CUSTOM_HF_REPO="$in_repo"
+      fi
+      read -r -p "文件名 (.strata/.gguf) 或 Strata 官方量化名 (留空自动探测，输入 CLEAR 清空) [当前: ${CUSTOM_HF_FILE}]: " in_file
+      if [[ "$in_file" == "CLEAR" ]]; then
+        CUSTOM_HF_FILE=""
+      elif [[ -n "$in_file" ]]; then
+        CUSTOM_HF_FILE="$in_file"
+      fi
+      MODEL_PRESET="strata-custom-hf"
+      ENGINE_TYPE="strata"
+      prompt_sync_recommended_hw "$MODEL_PRESET"
+      save_config
+      ;;
+    2)
+      echo ""
+      echo "Project Maya 模型参数示例:"
+      echo "  • 直接模型 ID: GLM-5.3-UD-IQ2_M / EXL3-4.05bpw / hy4-flash-q4_k_m / minimax-maya-s"
+      echo "  • DeepSeek 量化简写: ds4:gguf-iq3_s / ds4:exl3-2.25 / ds4:gguf-iq1_m"
+      echo "  • Hy4 量化简写: hy4:maya-s / hy4:q4_k_m"
+      read -r -p "Maya 模型参数 (输入 CLEAR 清空) [当前: ${CUSTOM_ENGINE_FAMILY}]: " in_marg
+      if [[ "$in_marg" == "CLEAR" ]]; then
+        CUSTOM_ENGINE_FAMILY=""
+      elif [[ -n "$in_marg" ]]; then
+        CUSTOM_ENGINE_FAMILY="$in_marg"
+      fi
+      read -r -p "可选自定义 HF 仓库 (下载后自动传 --model-dir，留空跳过，CLEAR 清空) [当前: ${CUSTOM_HF_REPO}]: " in_mrepo
+      if [[ "$in_mrepo" == "CLEAR" ]]; then
+        CUSTOM_HF_REPO=""
+      elif [[ -n "$in_mrepo" ]]; then
+        CUSTOM_HF_REPO="$in_mrepo"
+      fi
+      if [[ -n "$CUSTOM_HF_REPO" ]]; then
+        read -r -p "可选指定仓库内文件名 (留空自动拉取全部权重，CLEAR 清空) [当前: ${CUSTOM_HF_FILE}]: " in_mfile
+        if [[ "$in_mfile" == "CLEAR" ]]; then
+          CUSTOM_HF_FILE=""
+        elif [[ -n "$in_mfile" ]]; then
+          CUSTOM_HF_FILE="$in_mfile"
+        fi
+      fi
+      MODEL_PRESET="maya-custom"
+      ENGINE_TYPE="maya"
+      prompt_sync_recommended_hw "$MODEL_PRESET"
+      save_config
+      ;;
+  esac
+}
+
+select_model_preset_interactive() {
+  echo ""
+  echo "${C_BOLD}${C_CYAN}请选择模型硬件分组 (当前引擎: $(resolve_effective_engine "$MODEL_PRESET") | 当前预设: ${MODEL_PRESET}):${C_RESET}"
+  echo "  1) Free / 入门卡推荐 (T4 16GB, Std-RAM) — Strata + Inkling-2-Mini Uncensored (SQ-10/15/GGUF) & Maya Inkling"
+  echo "  2) 中端卡推荐 (L4 24GB / High-RAM)      — Strata SQ-20 / Qwen3.6 / Qwen3.8 Coder·Q2 & Maya GLM-S24 / Hy4-XS"
+  echo "  3) 旗舰卡推荐 (A100 / G4 / H100)        — Maya DeepSeek-V4.1 / GLM-5.3 744B / MiniMax-M3.1 / Hy4 & Strata 旗舰"
+  echo "  4) 自定义 Hugging Face 仓库 / 量化模型   — 任意 Strata .strata/.gguf 或 Project Maya 自定义模型"
+  echo "  5) 直接输入预设 ID"
+  echo "  0) 返回"
+  read -r -p "选择分组 [0-5]: " t_opt
+  case "${t_opt:-0}" in
+    1) select_preset_from_tier "free" "Free / 入门卡推荐 (T4 16GB, 标准内存)" || true ;;
+    2) select_preset_from_tier "mid" "中端卡推荐 (L4 24GB / A100 40GB / High-RAM)" || true ;;
+    3) select_preset_from_tier "flagship" "旗舰卡推荐 (A100 80GB / G4 96GB / H100 80GB)" || true ;;
+    4) configure_custom_model_interactive ;;
+    5)
+      read -r -p "输入预设 ID (如 strata-inkling-uncensored-sq10): " raw_id
+      if [[ -n "$raw_id" ]]; then
+        local resolved=""
+        if resolved="$(model_registry exists "$raw_id" 2>/dev/null)"; then
+          MODEL_PRESET="$resolved"
+          ENGINE_TYPE="auto"
+          prompt_sync_recommended_hw "$MODEL_PRESET"
+          save_config
+        else
+          echo "${C_RED}[无效预设] 未找到 '${raw_id}'。${C_RESET}"
+          sleep 1
+        fi
+      fi
+      ;;
+  esac
+}
+
+configure_engine_tuning_interactive() {
+  local eff_eng=""
+  eff_eng="$(resolve_effective_engine "$MODEL_PRESET")"
+  echo ""
+  echo "${C_BOLD}${C_CYAN}--- 引擎专属参数调优 (当前生效引擎: $(engine_label "$eff_eng")) ---${C_RESET}"
+  echo "  [Strata 参数]"
+  echo "    1) Strata KV 缓存格式     : ${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} (auto | int8 | fp8 | fp16 | q4_0)"
+  echo "    2) Strata 并发槽数        : ${C_GREEN}${STRATA_PARALLEL}${C_RESET} (1..64, Inkling 支持多并发)"
+  echo "    3) Strata 预编译/源码策略 : ${C_GREEN}${STRATA_BUILD_FALLBACK}${C_RESET} — $(strata_fallback_desc "$STRATA_BUILD_FALLBACK")"
+  echo "  [Project Maya 参数]"
+  echo "    4) MoE 专家全内存常驻策略 : ${C_GREEN}${EXPERT_RAM_POLICY}${C_RESET} — $(ram_policy_desc "$EXPERT_RAM_POLICY")"
+  echo "    5) Maya 拒绝消融开关      : $(maya_ablation_desc)"
+  echo "  [通用推理参数]"
+  echo "    6) 投机解码 (Drafting)    : ${C_GREEN}${MAYA_DRAFTING}${C_RESET} (on | off | measure)"
+  echo "    0) 返回"
+  read -r -p "请选择要修改的编号 [0-6]: " e_opt
+  case "${e_opt:-0}" in
+    1)
+      echo "可选 KV 格式:  1) auto  2) int8  3) fp8  4) fp16  5) q4_0"
+      read -r -p "选择编号 [1-5]: " kv_i
+      case "$kv_i" in
+        1) STRATA_KV_FORMAT="auto" ;;
+        2) STRATA_KV_FORMAT="int8" ;;
+        3) STRATA_KV_FORMAT="fp8" ;;
+        4) STRATA_KV_FORMAT="fp16" ;;
+        5) STRATA_KV_FORMAT="q4_0" ;;
+      esac
+      save_config
+      ;;
+    2)
+      read -r -p "输入并发请求槽数 (1-64) [当前: ${STRATA_PARALLEL}]: " sp_n
+      if [[ -n "$sp_n" ]]; then
+        if [[ "$sp_n" =~ ^[0-9]+$ && "$sp_n" -ge 1 && "$sp_n" -le 64 ]]; then
+          STRATA_PARALLEL="$sp_n"
+          save_config
+        else
+          echo "${C_RED}[忽略] 并发槽数需为 1-64。${C_RESET}"
+          sleep 1
+        fi
+      fi
+      ;;
+    3)
+      echo "  1) auto     : 驱动 >= 575.51 用官方预编译秒装，旧驱动自动回退源码编译 (推荐)"
+      echo "  2) prebuilt : 仅官方预编译包"
+      echo "  3) source   : 强制克隆仓库按当前节点 nvcc 原生架构源码编译"
+      read -r -p "选择编号 [1-3]: " sb_i
+      case "$sb_i" in
+        1) STRATA_BUILD_FALLBACK="auto" ;;
+        2) STRATA_BUILD_FALLBACK="prebuilt" ;;
+        3) STRATA_BUILD_FALLBACK="source" ;;
+      esac
+      save_config
+      ;;
+    4)
+      echo "可选 MoE 专家全内存常驻策略:"
+      echo "  1) auto       : 智能判断 (当显存+内存充足如 G4 272GB 时自动设置 --mmap-experts off 全载入内存)"
+      echo "  2) force_ram  : 强制锁死全内存 (注入 DS4_REQUIRE_ALL_RAM=1 / MAYA_GLM_RAM_RESIDENT=1，严禁落盘)"
+      echo "  3) allow_disk : 允许保留文件映射按需读盘 (--mmap-experts on，适合小内存环境)"
+      read -r -p "选择编号 [1-3]: " rp_idx
+      case "$rp_idx" in
+        1) EXPERT_RAM_POLICY="auto" ;;
+        2) EXPERT_RAM_POLICY="force_ram" ;;
+        3) EXPERT_RAM_POLICY="allow_disk" ;;
+      esac
+      save_config
+      ;;
+    5)
+      echo "Project Maya 拒绝方向消融 (--ablation / --ablate-default):"
+      echo "  1) 加载向量，按请求开启 (--ablation on, --ablate-default off，上游默认)"
+      echo "  2) 加载向量，所有请求全局默认去拒绝 (--ablation on + --ablate-default on)"
+      echo "  3) 完全关闭 (--ablation off)"
+      read -r -p "选择编号 [1-3]: " ab_i
+      case "$ab_i" in
+        1) MAYA_ABLATION="on";  MAYA_ABLATE_DEFAULT="off" ;;
+        2) MAYA_ABLATION="on";  MAYA_ABLATE_DEFAULT="on" ;;
+        3) MAYA_ABLATION="off"; MAYA_ABLATE_DEFAULT="off" ;;
+      esac
+      save_config
+      ;;
+    6)
+      echo "投机解码策略:  1) on (启用 DSpark/MTP)   2) off (关闭省显存)   3) measure (自动实测决定)"
+      read -r -p "选择编号 [1-3]: " dr_i
+      case "$dr_i" in
+        1) MAYA_DRAFTING="on" ;;
+        2) MAYA_DRAFTING="off" ;;
+        3) MAYA_DRAFTING="measure" ;;
+      esac
+      save_config
+      ;;
+  esac
+}
+
 page_settings() {
   while true; do
     clear 2>/dev/null || true
+    local eff_eng=""
+    eff_eng="$(resolve_effective_engine "$MODEL_PRESET")"
     echo "${C_BOLD}${C_CYAN}====================== 设置页 (自动持久化至本机 600 配置) ======================${C_RESET}"
     echo "  配置文件路径: ${CONFIG_FILE}"
     echo ""
-    echo "  1) 模型档位选择     : ${C_GREEN}${MODEL_PRESET}${C_RESET} — $(model_desc "$MODEL_PRESET")"
-    echo "  2) GPU 与内存规格   : ${C_GREEN}${GPU_TYPE}${C_RESET} (高内存 --high-mem: $( [[ "$HIGH_MEM" == "1" ]] && echo "开启" || echo "关闭" ))"
+    echo "  1) 引擎与模型选择   : [${C_CYAN}${eff_eng}${C_RESET}] ${C_GREEN}${MODEL_PRESET}${C_RESET} — $(model_title "$MODEL_PRESET")"
+    echo "     ${C_DIM}$(model_desc "$MODEL_PRESET")${C_RESET}"
+    echo "  2) GPU 与内存规格   : ${C_GREEN}${GPU_TYPE}${C_RESET} (高内存 --high-mem: $( [[ "$HIGH_MEM" == "1" ]] && echo "开启" || echo "关闭 / Free 兼容" ))"
     echo "  3) 运行期存储拓扑   : ${C_GREEN}${STORAGE_MODE}${C_RESET} — $(storage_desc "$STORAGE_MODE")"
     echo "  4) 云盘查找与回存   : 预查拉取=$( [[ "$DRIVE_PREFETCH" == "1" ]] && echo "${C_GREEN}开启${C_RESET}" || echo "关闭" ) | 回存策略=${C_GREEN}${DRIVE_SAVE_POLICY}${C_RESET} ($(save_policy_desc "$DRIVE_SAVE_POLICY"))"
-    echo "  5) 专家全内存常驻   : ${C_GREEN}${EXPERT_RAM_POLICY}${C_RESET} — $(ram_policy_desc "$EXPERT_RAM_POLICY")"
+    if [[ "$eff_eng" == "strata" ]]; then
+      echo "  5) 引擎专属调优     : Strata [KV=${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} | 并发=${C_GREEN}${STRATA_PARALLEL}${C_RESET} | 构建=${C_GREEN}${STRATA_BUILD_FALLBACK}${C_RESET} | 投机=${MAYA_DRAFTING}]"
+    else
+      echo "  5) 引擎专属调优     : Maya [内存=${C_GREEN}${EXPERT_RAM_POLICY}${C_RESET} | 消融=${C_GREEN}${MAYA_ABLATION}/${MAYA_ABLATE_DEFAULT}${C_RESET} | 投机=${MAYA_DRAFTING}]"
+    fi
     echo "  6) 修改存储目录路径 : 本地 NVMe=${CUSTOM_MODELS_DIR} | 云盘=${DRIVE_CACHE_DIR}"
     echo "  7) 暴露隧道模式     : ${C_GREEN}${TUNNEL_MODE}${C_RESET} — $(tunnel_desc "$TUNNEL_MODE")"
     echo "  8) Cloudflare 固定域: Token=$(mask_secret "$CF_TUNNEL_TOKEN") | 域名=${CF_PUBLIC_HOSTNAME:-(未填)}"
-    echo "  9) HuggingFace Token: $(mask_secret "$HF_TOKEN") (orcarouter 去审查版必填)"
+    echo "  9) HuggingFace Token: $(mask_secret "$HF_TOKEN") (受限/私有仓库必填)"
     echo "  10) API Key 与端口  : Key=$(mask_secret "$MAYA_API_KEY") | 端口=${MAYA_PORT} | 本地绑定=${LOCAL_BIND}"
     echo "  11) 上下文与界面开关: ${MAYA_CONTEXT} tok | 视觉=$( [[ "$NO_VISION" == "0" ]] && echo "开" || echo "关" ) | Web面板=$( [[ "$WEB_UI" == "1" ]] && echo "开" || echo "仅API" )"
     echo "  12) Colab 账号与认证: 账号=${C_GREEN}${ACTIVE_ACCOUNT:-(未登录)}${C_RESET} | 模式=${C_GREEN}${COLAB_AUTH_MODE}${C_RESET} | 启动自动 colab auth=$( [[ "$AUTO_GCP_AUTH" == "1" ]] && echo "开启" || echo "关闭" )"
@@ -256,26 +580,11 @@ page_settings() {
 
     case "${choice:-0}" in
       1)
-        echo ""
-        echo "可选模型档位:"
-        echo "  1) ds4-abliterated-128g : DeepSeek-V4.1-Flash-1017 Uncensored Mix-128G (~114GB + 161GB Engram, 推荐)"
-        echo "  2) ds4-abliterated-256g : DeepSeek-V4.1-Flash-1017 Uncensored Mix-256G (~236GB + 161GB Engram, 高精度)"
-        echo "  3) glm-maya-m-derisked  : GLM-5.3-Flash 321B 去拒绝权重版 (~116GB, 无 Engram 表, 免 HF Token)"
-        echo "  4) glm-maya-xs          : GLM-5.3-Flash 321B 轻量测试档 (~73.4GB)"
-        echo "  5) inkling-2-mini       : Inkling 2 Mini 26B 极速验证档 (~18.3GB)"
-        read -r -p "选择编号 [1-5]: " m_idx
-        case "$m_idx" in
-          1) MODEL_PRESET="ds4-abliterated-128g" ;;
-          2) MODEL_PRESET="ds4-abliterated-256g" ;;
-          3) MODEL_PRESET="glm-maya-m-derisked" ;;
-          4) MODEL_PRESET="glm-maya-xs" ;;
-          5) MODEL_PRESET="inkling-2-mini" ;;
-        esac
-        save_config
+        select_model_preset_interactive
         ;;
       2)
         echo ""
-        echo "可选 Colab GPU 类型:  1) G4 (RTX PRO 6000 96GB)  2) H100 (80GB)  3) A100 (80GB)  4) L4 (24GB)  5) T4 (16GB)"
+        echo "可选 Colab GPU 类型:  1) G4 (RTX PRO 6000 96GB)  2) H100 (80GB)  3) A100 (80GB)  4) L4 (24GB)  5) T4 (16GB, Free 可用)"
         read -r -p "选择编号 [1-5，回车保持 ${GPU_TYPE}]: " g_idx
         case "$g_idx" in
           1) GPU_TYPE="G4" ;;
@@ -284,18 +593,24 @@ page_settings() {
           4) GPU_TYPE="L4" ;;
           5) GPU_TYPE="T4" ;;
         esac
-        read -r -p "是否启用高内存形状 (--high-mem)? [Y/n]: " hm
-        if [[ "${hm:-Y}" =~ ^[Nn]$ ]]; then HIGH_MEM="0"; else HIGH_MEM="1"; fi
+        local hm_default="Y"
+        [[ "$GPU_TYPE" == "T4" ]] && hm_default="N"
+        if [[ "$GPU_TYPE" == "T4" ]]; then
+          read -r -p "是否启用高内存形状 (--high-mem)? (Colab Free 免费号选 N) [y/N]: " hm
+        else
+          read -r -p "是否启用高内存形状 (--high-mem)? [Y/n]: " hm
+        fi
+        if [[ "${hm:-$hm_default}" =~ ^[Nn]$ ]]; then HIGH_MEM="0"; else HIGH_MEM="1"; fi
         save_config
         ;;
       3)
         echo ""
         echo "可选运行期存储拓扑 (均支持配合第 4 项的云盘预查找与回存):"
-        echo "  1) auto         : 智能匹配 (235GB 本地盘跑 DeepSeek 时默认选反向跨盘 nvme_engram)"
+        echo "  1) auto         : 智能匹配 (小模型/无外挂表走本地盘，DeepSeek 在 235GB 盘走反向跨盘 nvme_engram)"
         echo "  2) nvme_engram  : 反向跨盘推荐 — Engram 拉取到本地高速 NVMe 跑 + 主权重挂云盘全进内存 (推理零网盘 I/O)"
         echo "  3) drive_engram : 正向跨盘 — 主权重放本地 NVMe + 161GB Engram 软链在云盘上按需查表"
         echo "  4) drive_full   : 全量云盘直连 — 所有权重与表均直接在 Google Drive 目录读写"
-        echo "  5) local_nvme   : 纯本地/Enterprise 高速盘 — 所有文件在本地盘运行 (仍可从云盘拉取/回存)"
+        echo "  5) local_nvme   : 纯本地高速盘 — 所有文件在本地盘运行 (Free T4 / 轻模型推荐，仍可配合云盘拉取/回存)"
         read -r -p "选择编号 [1-5]: " s_idx
         case "$s_idx" in
           1) STORAGE_MODE="auto" ;;
@@ -312,10 +627,10 @@ page_settings() {
         if [[ "${pf:-Y}" =~ ^[Nn]$ ]]; then DRIVE_PREFETCH="0"; else DRIVE_PREFETCH="1"; fi
         echo ""
         echo "当云盘缺失分片并触发公网回退下载后，是否将新分片持久化回存云盘?"
-        echo "  1) both         : 主权重与 161GB Engram 均同步回存云盘 (适合 300GB+ 云盘，下次全免下载)"
-        echo "  2) weights_only : 仅将主权重 (~114GB) 存云盘，161GB Engram 仅在本地临时盘用 (适合 200GB 云盘)"
+        echo "  1) both         : 主权重与 Engram 均同步回存云盘 (下次全免公网下载)"
+        echo "  2) weights_only : 仅将主权重存云盘，161GB Engram 仅在本地临时盘用 (适合 200GB 云盘)"
         echo "  3) engram_only  : 仅将 161GB Engram 回存云盘"
-        echo "  4) none         : 不向云盘写入任何新下载分片 (云盘仅作只读缓存源或完全不写)"
+        echo "  4) none         : 不向云盘写入任何新下载分片 (云盘仅作只读缓存源或完全不写，Free 号推荐)"
         read -r -p "选择回存策略 [1-4，回车保持 ${DRIVE_SAVE_POLICY}]: " sp_idx
         case "$sp_idx" in
           1) DRIVE_SAVE_POLICY="both" ;;
@@ -326,18 +641,7 @@ page_settings() {
         save_config
         ;;
       5)
-        echo ""
-        echo "可选 MoE 专家全内存常驻策略:"
-        echo "  1) auto       : 智能判断 (当显存+内存充足如 G4 272GB 时自动设置 --mmap-experts off 全载入内存)"
-        echo "  2) force_ram  : 强制锁死全内存 (注入 DS4_REQUIRE_ALL_RAM=1 / MAYA_GLM_RAM_RESIDENT=1，严禁落盘)"
-        echo "  3) allow_disk : 允许保留文件映射按需读盘 (--mmap-experts on，适合小内存环境)"
-        read -r -p "选择编号 [1-3]: " rp_idx
-        case "$rp_idx" in
-          1) EXPERT_RAM_POLICY="auto" ;;
-          2) EXPERT_RAM_POLICY="force_ram" ;;
-          3) EXPERT_RAM_POLICY="allow_disk" ;;
-        esac
-        save_config
+        configure_engine_tuning_interactive
         ;;
       6)
         echo ""
@@ -507,10 +811,11 @@ run_interactive_loop() {
 
   while true; do
     clear 2>/dev/null || true
-    local status_badge ep phase sync_st
+    local status_badge ep phase sync_st eff_eng
     ep="$(resolve_current_endpoint)"
     phase="$(read_telemetry_field phase)"
     sync_st="$(read_telemetry_field cache_sync_state)"
+    eff_eng="$(resolve_effective_engine "$MODEL_PRESET")"
     if is_bg_running; then
       status_badge="${C_GREEN}● 运行中${C_RESET} (${phase:-正在连接远端...})"
     else
@@ -518,23 +823,27 @@ run_interactive_loop() {
     fi
 
     echo "${C_BOLD}${C_CYAN}=========================================================================${C_RESET}"
-    echo "${C_BOLD}   colabd v${COLABD_VERSION}  |  Frontier LLM Serving Daemon on Google Colab${C_RESET}"
+    echo "${C_BOLD}   colabd v${COLABD_VERSION}  |  Multi-Engine LLM Serving Daemon (Strata + Project Maya)${C_RESET}"
     echo "${C_CYAN}=========================================================================${C_RESET}"
     echo "  运行环境   : $(format_runtime_badge)"
     echo "  Colab 账号 : $(format_auth_badge)"
     echo "  实例状态   : ${status_badge}"
-    echo "  当前模型   : ${C_BOLD}${MODEL_PRESET}${C_RESET}  |  GPU: ${C_BOLD}${GPU_TYPE}${C_RESET}$( [[ "$HIGH_MEM" == "1" ]] && echo " (High-RAM)" )"
-    echo "  存储拓扑   : ${C_BOLD}${STORAGE_MODE}${C_RESET} (预查云盘: $( [[ "$DRIVE_PREFETCH" == "1" ]] && echo "开" || echo "关" ) | 回存云盘: ${DRIVE_SAVE_POLICY} | 内存策略: ${EXPERT_RAM_POLICY})"
+    echo "  引擎与模型 : ${C_CYAN}${eff_eng}${C_RESET} | ${C_BOLD}${MODEL_PRESET}${C_RESET}  |  GPU: ${C_BOLD}${GPU_TYPE}${C_RESET}$( [[ "$HIGH_MEM" == "1" ]] && echo " (High-RAM)" || echo " (Std-RAM)" )"
+    if [[ "$eff_eng" == "strata" ]]; then
+      echo "  存储与参数 : ${C_BOLD}${STORAGE_MODE}${C_RESET} (预查云盘: $( [[ "$DRIVE_PREFETCH" == "1" ]] && echo "开" || echo "关" ) | 回存: ${DRIVE_SAVE_POLICY} | KV: ${STRATA_KV_FORMAT} | 并发: ${STRATA_PARALLEL})"
+    else
+      echo "  存储拓扑   : ${C_BOLD}${STORAGE_MODE}${C_RESET} (预查云盘: $( [[ "$DRIVE_PREFETCH" == "1" ]] && echo "开" || echo "关" ) | 回存云盘: ${DRIVE_SAVE_POLICY} | 内存策略: ${EXPERT_RAM_POLICY})"
+    fi
     echo "  暴露隧道   : $(tunnel_desc "$TUNNEL_MODE")"
     if [[ -n "$ep" ]]; then
       echo "  访问入口   : ${C_GREEN}${C_BOLD}${ep}${C_RESET}"
     fi
     echo "${C_CYAN}-------------------------------------------------------------------------${C_RESET}"
     echo "  1) 启动 / 重启 Colab 实例与大模型隧道服务"
-    echo "  2) 状态监控页 (硬件/内存驻留/云盘同步状态、API 探测、colab usage 余额)"
-    echo "  3) 实时查看远端分片拉取、编译与推理日志 (Ctrl+C 返回菜单)"
+    echo "  2) 状态监控页 (硬件/驱动/引擎状态、云盘同步、API 探测、colab usage 余额)"
+    echo "  3) 实时查看远端分片拉取、引擎初始化与推理日志 (Ctrl+C 返回菜单)"
     echo "  4) 一键发送流式对话测试请求 (curl /v1/chat/completions)"
-    echo "  5) 设置页 (切换模型 / 存储拓扑 / 云盘查找与回存策略 / 隧道，自动保存)"
+    echo "  5) 设置页 (切换引擎与分级模型 / 自定义 HF / 存储拓扑 / 隧道，自动保存)"
     echo "  6) Colab 账号管理与授权中心 (登录去重 / 秒切 / 权限补齐 / 安全移除 / 全局释放)"
     echo "  7) 手动销毁当前 Colab 实例 (保持面板打开以便修改配置重开)"
     echo "  0) 退出面板 (自动执行 colab stop 回收实例与释放算力)"
