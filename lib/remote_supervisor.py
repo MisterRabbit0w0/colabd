@@ -77,7 +77,7 @@ MAYA_CONTEXT: str = str(CONFIG.get("maya_context", "65536"))
 MAYA_DRAFTING: str = str(CONFIG.get("maya_drafting", "on"))
 MAYA_PORT: int = int(CONFIG.get("maya_port", "8081"))
 REMOTE_PORT: int = int(CONFIG.get("remote_port") or MAYA_PORT)
-STRATA_KV_FORMAT: str = str(CONFIG.get("strata_kv_format", "auto")).strip().lower()
+STRATA_KV_FORMAT: str = str(CONFIG.get("strata_kv_format", "auto")).strip().lower() or "auto"
 STRATA_PARALLEL: str = str(CONFIG.get("strata_parallel", "1")).strip()
 STRATA_BUILD_FALLBACK: str = str(CONFIG.get("strata_build_fallback", "auto")).strip().lower()
 MAYA_ABLATION: str = str(CONFIG.get("maya_ablation", "on")).strip().lower()
@@ -491,6 +491,15 @@ def patch_existing_maya_configs(maya_dir: Path, ram_resident: bool) -> None:
                         changed = True
                     if isinstance(data.get("ablate"), dict) and data["ablate"].get("default") != "on":
                         data["ablate"]["default"] = "on"
+                        changed = True
+                if STRATA_KV_FORMAT and STRATA_KV_FORMAT != "auto":
+                    if "--kv" in args:
+                        i = args.index("--kv")
+                        if i + 1 < len(args) and args[i + 1] != STRATA_KV_FORMAT:
+                            args[i + 1] = STRATA_KV_FORMAT
+                            changed = True
+                    else:
+                        args.extend(["--kv", STRATA_KV_FORMAT])
                         changed = True
             if changed:
                 cfg_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -2203,6 +2212,9 @@ def build_maya_cmd(
 
     if MAYA_ABLATION in ("on", "off"):
         cmd.extend(["--ablation", MAYA_ABLATION])
+
+    if STRATA_KV_FORMAT and STRATA_KV_FORMAT != "auto":
+        cmd.extend(["--kv", STRATA_KV_FORMAT])
 
     if ram_resident:
         if family == "ds4":

@@ -116,11 +116,11 @@ Configure both the runtime layout (`STORAGE_MODE`) and download/Drive write tran
 
 ```bash
 colabd                         # Open the interactive TUI control panel
-colabd up [--model ID] [--engine strata|maya] [--gpu T4|L4|A100|G4|H100] [--standard-mem|--high-mem]
+colabd up [--model ID] [--engine strata|maya] [--gpu T4|L4|A100|G4|H100] [--standard-mem|--high-mem] [--kv PRECISION]
                                # Allocate/start runtime immediately and attach TUI tether
 colabd models [--tier free|mid|flagship|custom] [--engine strata|maya]
                                # List built-in presets grouped by hardware tier & engine
-colabd use <preset-id> [--engine strata|maya] [--keep-hw]
+colabd use <preset-id> [--engine strata|maya] [--kv PRECISION] [--keep-hw]
                                # Switch active preset and auto-apply recommended GPU/RAM settings
 colabd auth                    # Open account management, scope check & GCP auth center
 colabd auth list               # List logged-in accounts (deduped by email), scope status & sessions

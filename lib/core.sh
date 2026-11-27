@@ -76,7 +76,7 @@ reset_defaults() {
   CUSTOM_ENGINE_FAMILY="inkling-2-mini"        # Engine model family or custom model argument
   MAYA_CONTEXT="65536"                         # 32768 | 65536 | 131072 | 262144
   MAYA_DRAFTING="on"                           # on | off | measure
-  STRATA_KV_FORMAT="auto"                      # auto | int8 | fp8 | fp16 | q4_0
+  STRATA_KV_FORMAT="auto"                      # auto | int8 | k8v4 | q4_0 | fp8 | fp16 | <custom>
   STRATA_PARALLEL="1"                          # 1..64 concurrent slots
   STRATA_BUILD_FALLBACK="auto"                 # auto | prebuilt | source
   MAYA_ABLATION="on"                           # on | off (--ablation flag for Project Maya)
@@ -172,9 +172,33 @@ load_config() {
     if [[ ! "${HF_DOWNLOAD_CONCURRENCY:-8}" =~ ^[0-9]+$ || "${HF_DOWNLOAD_CONCURRENCY:-8}" -lt 1 || "${HF_DOWNLOAD_CONCURRENCY:-8}" -gt 16 ]]; then
       HF_DOWNLOAD_CONCURRENCY="8"
     fi
+    STRATA_KV_FORMAT="$(normalize_kv_format "${STRATA_KV_FORMAT:-auto}")"
+    if [[ -z "$STRATA_KV_FORMAT" ]]; then
+      STRATA_KV_FORMAT="auto"
+    fi
   else
     save_config
   fi
+}
+
+normalize_kv_format() {
+  local raw="${1:-}"
+  printf '%s' "$raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]'
+}
+
+is_valid_kv_format() {
+  local val="${1:-}"
+  [[ -n "$val" && "$val" =~ ^[A-Za-z0-9._+-]+$ ]]
+}
+
+set_kv_format_validated() {
+  local norm=""
+  norm="$(normalize_kv_format "${1:-}")"
+  if ! is_valid_kv_format "$norm"; then
+    return 1
+  fi
+  STRATA_KV_FORMAT="$norm"
+  return 0
 }
 
 account_dir_path() {

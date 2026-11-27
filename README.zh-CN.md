@@ -92,11 +92,11 @@ colabd
 
 ```bash
 colabd                         # 启动交互式数字菜单控制台 (默认)
-colabd up [--model ID] [--engine strata|maya] [--gpu T4|L4|A100|G4|H100] [--standard-mem|--high-mem]
+colabd up [--model ID] [--engine strata|maya] [--gpu T4|L4|A100|G4|H100] [--standard-mem|--high-mem] [--kv PRECISION]
                                # 直接拉起配置的 Colab 实例并进入控制台保活 (支持命令行快速覆盖)
 colabd models [--tier free|mid|flagship|custom] [--engine strata|maya]
                                # 按硬件层级查看全部内置模型与引擎预设
-colabd use <preset-id> [--engine strata|maya] [--keep-hw]
+colabd use <preset-id> [--engine strata|maya] [--kv PRECISION] [--keep-hw]
                                # 一键切换模型预设并自动匹配推荐 GPU / High-RAM 规格
 colabd auth                    # 打开账号管理、权限域校验与远端 GCP 授权中心
 colabd auth list               # 按唯一账号 ID (邮箱) 查看已登录账号、权限状态与活跃实例

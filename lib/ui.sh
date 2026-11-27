@@ -176,10 +176,10 @@ page_status() {
     echo "  当前执行阶段 : ${phase:-尚未启动}"
     echo "  远端硬件信息 : GPU=${gpu:-未知}$( [[ -n "$drv_ver" ]] && echo " | Driver=${drv_ver}" ) | 系统RAM=${ram_gb:-0} GiB"
     if [[ "$eff_eng" == "strata" ]]; then
-      echo "  Strata 参数  : KV=${STRATA_KV_FORMAT} | 并发=${STRATA_PARALLEL} | 驱动构建策略=${STRATA_BUILD_FALLBACK} | 投机解码=${MAYA_DRAFTING}"
+      echo "  Strata 参数  : KV Cache=${STRATA_KV_FORMAT} | 并发=${STRATA_PARALLEL} | 驱动构建策略=${STRATA_BUILD_FALLBACK} | 投机解码=${MAYA_DRAFTING}"
     else
       echo "  专家内存常驻 : $( [[ "$ram_res" == "True" || "$ram_res" == "true" ]] && echo "${C_GREEN}已激活 (--mmap-experts off，零专家交换)${C_RESET}" || echo "默认按需映射 (${EXPERT_RAM_POLICY})" )"
-      echo "  Maya 消融态  : $(maya_ablation_desc)"
+      echo "  Maya 参数    : KV Cache=${STRATA_KV_FORMAT} | 投机解码=${MAYA_DRAFTING} | $(maya_ablation_desc)"
     fi
     echo "  远端磁盘余量 : 本地 /content 剩余 ${local_free:-未知} GiB | 云盘剩余 ${drive_free:-未挂载} GiB$( [[ -n "$dfs_gb" && "$dfs_gb" != "0" && "$dfs_gb" != "0.0" ]] && echo " | DriveFS缓存 ${dfs_gb} GiB" )"
     echo "  工作目录拓扑 : ${models_dir:-尚未初始化} (模式: ${STORAGE_MODE} | HF并发: ${HF_DOWNLOAD_CONCURRENCY} 线程)"
@@ -466,8 +466,8 @@ configure_engine_tuning_interactive() {
   eff_eng="$(resolve_effective_engine "$MODEL_PRESET")"
   echo ""
   echo "${C_BOLD}${C_CYAN}--- 引擎专属参数调优 (当前生效引擎: $(engine_label "$eff_eng")) ---${C_RESET}"
-  echo "  [Strata 参数]"
-  echo "    1) Strata KV 缓存格式     : ${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} (auto | int8 | fp8 | fp16 | q4_0)"
+  echo "  [通用 Cache / Strata 参数]"
+  echo "    1) KV Cache 精度策略      : ${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} (auto | int8 | k8v4 | q4_0 | fp8 | fp16 | 自定义)"
   echo "    2) Strata 并发槽数        : ${C_GREEN}${STRATA_PARALLEL}${C_RESET} (1..64，取决于模型与显存容量)"
   echo "    3) Strata 预编译/源码策略 : ${C_GREEN}${STRATA_BUILD_FALLBACK}${C_RESET} — $(strata_fallback_desc "$STRATA_BUILD_FALLBACK")"
   echo "  [Project Maya 参数]"
@@ -479,16 +479,39 @@ configure_engine_tuning_interactive() {
   read -r -p "请选择要修改的编号 [0-6]: " e_opt
   case "${e_opt:-0}" in
     1)
-      echo "可选 KV 格式:  1) auto  2) int8  3) fp8  4) fp16  5) q4_0"
-      read -r -p "选择编号 [1-5]: " kv_i
+      echo "可选 KV Cache 精度 (同时作用于 Strata 与 Project Maya --kv):"
+      echo "  1) auto  : 引擎默认自适应"
+      echo "  2) int8  : 8-bit 整型量化 (较 fp16 省约一半显存)"
+      echo "  3) k8v4  : Key 8-bit + Value 4-bit 混合压缩 (较 int8 再省 ~23% 显存)"
+      echo "  4) q4_0  : 4-bit Hadamard 压缩 (较 int8 再省约一半显存，T4 / 大上下文推荐)"
+      echo "  5) fp8   : 8-bit 浮点量化"
+      echo "  6) fp16  : 半精度无损浮点"
+      echo "  7) 自定义输入 (例如 q8_0 / bf16 / fp8_e4m3)"
+      read -r -p "选择编号 [1-7，或直接输入精度名，回车保持 ${STRATA_KV_FORMAT}]: " kv_i
+      local kv_cand=""
       case "$kv_i" in
-        1) STRATA_KV_FORMAT="auto" ;;
-        2) STRATA_KV_FORMAT="int8" ;;
-        3) STRATA_KV_FORMAT="fp8" ;;
-        4) STRATA_KV_FORMAT="fp16" ;;
-        5) STRATA_KV_FORMAT="q4_0" ;;
+        "") ;;
+        1) kv_cand="auto" ;;
+        2) kv_cand="int8" ;;
+        3) kv_cand="k8v4" ;;
+        4) kv_cand="q4_0" ;;
+        5) kv_cand="fp8" ;;
+        6) kv_cand="fp16" ;;
+        7)
+          read -r -p "输入自定义 KV Cache 精度 (如 q8_0、k8v4、q4_0、bf16): " kv_cand
+          ;;
+        *)
+          kv_cand="$kv_i"
+          ;;
       esac
-      save_config
+      if [[ -n "$kv_cand" ]]; then
+        if set_kv_format_validated "$kv_cand"; then
+          save_config
+        else
+          echo "${C_RED}[忽略] Cache 精度 '${kv_cand}' 无效（仅允许字母、数字、.、_、+、-）。${C_RESET}"
+          sleep 1
+        fi
+      fi
       ;;
     2)
       read -r -p "输入并发请求槽数 (1-64) [当前: ${STRATA_PARALLEL}]: " sp_n
@@ -569,7 +592,7 @@ page_settings() {
     if [[ "$eff_eng" == "strata" ]]; then
       echo "  5) 引擎专属调优     : Strata [KV=${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} | 并发=${C_GREEN}${STRATA_PARALLEL}${C_RESET} | 构建=${C_GREEN}${STRATA_BUILD_FALLBACK}${C_RESET} | 投机=${MAYA_DRAFTING}]"
     else
-      echo "  5) 引擎专属调优     : Maya [内存=${C_GREEN}${EXPERT_RAM_POLICY}${C_RESET} | 消融=${C_GREEN}${MAYA_ABLATION}/${MAYA_ABLATE_DEFAULT}${C_RESET} | 投机=${MAYA_DRAFTING}]"
+      echo "  5) 引擎专属调优     : Maya [内存=${C_GREEN}${EXPERT_RAM_POLICY}${C_RESET} | KV=${C_GREEN}${STRATA_KV_FORMAT}${C_RESET} | 消融=${C_GREEN}${MAYA_ABLATION}/${MAYA_ABLATE_DEFAULT}${C_RESET} | 投机=${MAYA_DRAFTING}]"
     fi
     echo "  6) 修改存储目录路径 : 本地 NVMe=${CUSTOM_MODELS_DIR} | 云盘=${DRIVE_CACHE_DIR}"
     echo "  7) 暴露隧道模式     : ${C_GREEN}${TUNNEL_MODE}${C_RESET} — $(tunnel_desc "$TUNNEL_MODE")"
@@ -842,7 +865,7 @@ run_interactive_loop() {
     if [[ "$eff_eng" == "strata" ]]; then
       echo "  存储与参数 : ${C_BOLD}${STORAGE_MODE}${C_RESET} (HF并发: ${HF_DOWNLOAD_CONCURRENCY}x | 云盘写: ${DRIVE_WRITE_MODE} | KV: ${STRATA_KV_FORMAT} | 并发: ${STRATA_PARALLEL})"
     else
-      echo "  存储拓扑   : ${C_BOLD}${STORAGE_MODE}${C_RESET} (HF并发: ${HF_DOWNLOAD_CONCURRENCY}x | 云盘写: ${DRIVE_WRITE_MODE} | 内存策略: ${EXPERT_RAM_POLICY})"
+      echo "  存储拓扑   : ${C_BOLD}${STORAGE_MODE}${C_RESET} (HF并发: ${HF_DOWNLOAD_CONCURRENCY}x | 云盘写: ${DRIVE_WRITE_MODE} | KV: ${STRATA_KV_FORMAT} | 内存策略: ${EXPERT_RAM_POLICY})"
     fi
     echo "  暴露隧道   : $(tunnel_desc "$TUNNEL_MODE")"
     if [[ -n "$ep" ]]; then

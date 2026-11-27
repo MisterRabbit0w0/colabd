@@ -44,11 +44,11 @@ The endgame for frontier LLM serving on Google Colab.
 
 Usage:
   colabd                                  Launch the interactive TUI control panel (default)
-  colabd up [--model ID] [--engine strata|maya] [--gpu GPU] [--standard-mem|--high-mem]
+  colabd up [--model ID] [--engine strata|maya] [--gpu GPU] [--standard-mem|--high-mem] [--kv PRECISION]
                                           Start the configured Colab runtime and enter the TUI tether
   colabd models [--tier free|mid|flagship|custom] [--engine strata|maya]
                                           List built-in model presets grouped by hardware tier
-  colabd use <preset-id> [--engine strata|maya] [--keep-hw]
+  colabd use <preset-id> [--engine strata|maya] [--kv PRECISION] [--keep-hw]
                                           Switch active model preset (auto-applies recommended GPU/RAM)
   colabd auth                             Open the interactive account management & GCP auth center
   colabd auth list                        List logged-in accounts (deduped by email), scope status & sessions
@@ -400,6 +400,7 @@ handle_models_cli() {
 handle_use_cli() {
   local target=""
   local eng_ov=""
+  local kv_ov=""
   local keep_hw=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -417,6 +418,17 @@ handle_use_cli() {
       --engine=*)
         eng_ov="${1#--engine=}"
         ;;
+      --kv)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing KV cache precision after $1 (e.g. auto|int8|k8v4|q4_0|fp8|fp16|<custom>)" >&2
+          return 1
+        fi
+        kv_ov="$2"
+        shift
+        ;;
+      --kv=*)
+        kv_ov="${1#--kv=}"
+        ;;
       -*)
         echo "[ERROR] Unknown option for 'colabd use': $1" >&2
         return 1
@@ -429,7 +441,7 @@ handle_use_cli() {
   done
 
   if [[ -z "$target" ]]; then
-    echo "[ERROR] Usage: colabd use <preset-id> [--engine strata|maya|auto] [--keep-hw]" >&2
+    echo "[ERROR] Usage: colabd use <preset-id> [--engine strata|maya|auto] [--kv PRECISION] [--keep-hw]" >&2
     return 1
   fi
 
@@ -451,6 +463,13 @@ handle_use_cli() {
     ENGINE_TYPE="auto"
   fi
 
+  if [[ -n "$kv_ov" ]]; then
+    if ! set_kv_format_validated "$kv_ov"; then
+      echo "[ERROR] 无效 KV Cache 精度 '${kv_ov}' (仅允许 auto 或字母/数字/._+- 组合，如 int8、k8v4、q4_0、fp8、fp16)。" >&2
+      return 1
+    fi
+  fi
+
   MODEL_PRESET="$resolved"
   if [[ "$keep_hw" -eq 0 ]]; then
     apply_recommended_hardware_for_preset "$MODEL_PRESET"
@@ -462,7 +481,7 @@ handle_use_cli() {
   echo "${C_GREEN}[已切换] 模型预设: ${MODEL_PRESET}${C_RESET}"
   echo "  推理引擎 : $(engine_label "$eff_eng")"
   echo "  模型说明 : $(model_desc "$MODEL_PRESET")"
-  echo "  硬件配置 : GPU=${GPU_TYPE} | High-RAM=$( [[ "$HIGH_MEM" == "1" ]] && echo "开启" || echo "关闭 (Free 兼容)" ) | 上下文=${MAYA_CONTEXT} | 存储=${STORAGE_MODE}"
+  echo "  硬件配置 : GPU=${GPU_TYPE} | High-RAM=$( [[ "$HIGH_MEM" == "1" ]] && echo "开启" || echo "关闭 (Free 兼容)" ) | 上下文=${MAYA_CONTEXT} | KV=${STRATA_KV_FORMAT} | 存储=${STORAGE_MODE}"
   return 0
 }
 
@@ -512,6 +531,25 @@ handle_up_args() {
         ;;
       --standard-mem|--no-high-mem)
         HIGH_MEM="0"
+        changed=1
+        ;;
+      --kv)
+        if [[ $# -lt 2 ]]; then
+          echo "[ERROR] Missing KV cache precision after $1 (e.g. auto|int8|k8v4|q4_0|fp8|fp16|<custom>)" >&2
+          return 1
+        fi
+        if ! set_kv_format_validated "$2"; then
+          echo "[ERROR] Invalid KV cache precision '$2' (expected auto or alphanumeric/._+- tag)" >&2
+          return 1
+        fi
+        changed=1
+        shift
+        ;;
+      --kv=*)
+        if ! set_kv_format_validated "${1#--kv=}"; then
+          echo "[ERROR] Invalid KV cache precision '${1#--kv=}' (expected auto or alphanumeric/._+- tag)" >&2
+          return 1
+        fi
         changed=1
         ;;
       *)

@@ -962,6 +962,10 @@ validate_runtime_settings() {
     echo "${C_RED}[配置错误] STRATA_PARALLEL '${STRATA_PARALLEL}' 无效（需为 1-64），请进设置页 [5] 修改。${C_RESET}"
     return 1
   fi
+  if ! set_kv_format_validated "${STRATA_KV_FORMAT:-auto}"; then
+    echo "${C_RED}[配置错误] STRATA_KV_FORMAT '${STRATA_KV_FORMAT}' 无效（仅允许 auto 或字母/数字/._+- 组合，如 int8、k8v4、q4_0、fp8、fp16），请进设置页 [5] 修改。${C_RESET}"
+    return 1
+  fi
   if [[ ! "${HF_DOWNLOAD_CONCURRENCY:-8}" =~ ^[0-9]+$ || "${HF_DOWNLOAD_CONCURRENCY:-8}" -lt 1 || "${HF_DOWNLOAD_CONCURRENCY:-8}" -gt 16 ]]; then
     echo "${C_RED}[配置错误] HF_DOWNLOAD_CONCURRENCY '${HF_DOWNLOAD_CONCURRENCY}' 无效（需为 1-16），请进设置页 [4] 修改。${C_RESET}"
     return 1

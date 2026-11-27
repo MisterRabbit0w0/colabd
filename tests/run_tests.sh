@@ -1564,6 +1564,66 @@ patched = json.loads(ik2_cfg.read_text())
 assert patched["args"][patched["args"].index("--ablate-default") + 1] == "on"
 assert patched["ablate"]["default"] == "on"
 assert "--mmap-experts" in patched["args"] and patched["args"][patched["args"].index("--mmap-experts") + 1] == "off"
+assert "--kv" not in m_args and "--kv" not in patched["args"]
+
+# Verify custom KV cache precision (CLI use/up, validation, Strata & Maya command/config generation)
+kv_cfg_home = box / "kv_cfg"
+subprocess.run(
+    [str(root / "bin" / "colabd"), "use", "strata-inkling-uncensored-sq10", "--kv", "K8V4"],
+    env={**os.environ, "XDG_CONFIG_HOME": str(kv_cfg_home)},
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
+kv_env_text = (kv_cfg_home / "colabd" / "config.env").read_text()
+assert "STRATA_KV_FORMAT=k8v4" in kv_env_text
+
+subprocess.run(
+    [str(root / "bin" / "colabd"), "use", "maya-inkling-2-mini", "--kv=Q8_0"],
+    env={**os.environ, "XDG_CONFIG_HOME": str(kv_cfg_home)},
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
+kv_env_text2 = (kv_cfg_home / "colabd" / "config.env").read_text()
+assert "STRATA_KV_FORMAT=q8_0" in kv_env_text2
+
+bad_kv = subprocess.run(
+    [str(root / "bin" / "colabd"), "use", "strata-inkling-uncensored-sq10", "--kv", "q4_0;rm"],
+    env={**os.environ, "XDG_CONFIG_HOME": str(kv_cfg_home)},
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+assert bad_kv.returncode != 0
+
+custom_kv_cmd = f"""
+export TMPDIR="{box}/tmp"
+export XDG_CONFIG_HOME="{kv_cfg_home}"
+export COLABD_RUNTIME_DIR="{box}/rt"
+COLABD_LIB_DIR="{root}/lib"
+source "{root}/lib/core.sh"
+source "{root}/lib/env.sh"
+source "{root}/lib/auth.sh"
+source "{root}/lib/lifecycle.sh"
+load_config
+set_kv_format_validated "  fp8_e4m3  "
+[[ "$STRATA_KV_FORMAT" == "fp8_e4m3" ]]
+validate_runtime_settings >/dev/null
+build_remote_runner "local_nvme"
+echo "$RUNNER_PY"
+"""
+custom_kv_runner = subprocess.check_output(["bash", "-c", custom_kv_cmd], text=True).strip().splitlines()[-1]
+ns_kv = {"__name__": "unit_test_custom_kv"}
+exec(compile(pathlib.Path(custom_kv_runner).read_text(), custom_kv_runner, "exec"), ns_kv)
+assert ns_kv["STRATA_KV_FORMAT"] == "fp8_e4m3"
+kv_maya_args = ns_kv["build_maya_cmd"](box / "work" / "maya-models", True, no_start=True)
+assert "--kv" in kv_maya_args and kv_maya_args[kv_maya_args.index("--kv") + 1] == "fp8_e4m3"
+ns_kv["patch_existing_maya_configs"](maya_dir, True)
+patched_kv = json.loads(ik2_cfg.read_text())
+assert "--kv" in patched_kv["args"] and patched_kv["args"][patched_kv["args"].index("--kv") + 1] == "fp8_e4m3"
+
+kv_strata_launch = ns_kv["build_strata_launch_cmd"]("/content/strata-bin/strata", {"family": "inkling-2-mini", "model": "SQ-10"}, models_dir / "strata-data", local_strata)
+assert "--kv" in kv_strata_launch and kv_strata_launch[kv_strata_launch.index("--kv") + 1] == "fp8_e4m3"
+kv_strata_src = ns_kv["build_strata_source_setup_cmd"](pathlib.Path("/content/Strata/setup.sh"), {"family": "inkling-2-mini", "model": "SQ-10"}, models_dir / "strata-data", local_strata)
+assert "--kv" in kv_strata_src and kv_strata_src[kv_strata_src.index("--kv") + 1] == "fp8_e4m3"
 PYMULTI
 
 echo "ALL TESTS PASSED."
